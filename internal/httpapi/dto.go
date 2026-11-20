@@ -13,11 +13,13 @@ import (
 // contract (api/openapi.yaml) can evolve independently of storage.
 
 type createNotificationRequest struct {
-	Channel     string     `json:"channel"`
-	Recipient   string     `json:"recipient"`
-	Content     string     `json:"content"`
-	Priority    string     `json:"priority,omitempty"`
-	ScheduledAt *time.Time `json:"scheduled_at,omitempty"`
+	Channel     string         `json:"channel"`
+	Recipient   string         `json:"recipient"`
+	Content     string         `json:"content"`
+	Priority    string         `json:"priority,omitempty"`
+	ScheduledAt *time.Time     `json:"scheduled_at,omitempty"`
+	TemplateID  *uuid.UUID     `json:"template_id,omitempty"`
+	Variables   map[string]any `json:"variables,omitempty"`
 }
 
 func (r createNotificationRequest) toInput() notification.CreateInput {
@@ -27,6 +29,8 @@ func (r createNotificationRequest) toInput() notification.CreateInput {
 		Content:     r.Content,
 		Priority:    r.Priority,
 		ScheduledAt: r.ScheduledAt,
+		TemplateID:  r.TemplateID,
+		Variables:   r.Variables,
 	}
 }
 
@@ -35,24 +39,26 @@ type createBatchRequest struct {
 }
 
 type notificationResponse struct {
-	ID                uuid.UUID  `json:"id"`
-	BatchID           *uuid.UUID `json:"batch_id,omitempty"`
-	Channel           string     `json:"channel"`
-	Priority          string     `json:"priority"`
-	Recipient         string     `json:"recipient"`
-	Content           string     `json:"content"`
-	Status            string     `json:"status"`
-	Attempts          int        `json:"attempts"`
-	MaxAttempts       int        `json:"max_attempts"`
-	ScheduledAt       *time.Time `json:"scheduled_at,omitempty"`
-	NextAttemptAt     *time.Time `json:"next_attempt_at,omitempty"`
-	LastError         *string    `json:"last_error,omitempty"`
-	ProviderMessageID *string    `json:"provider_message_id,omitempty"`
-	IdempotencyKey    *string    `json:"idempotency_key,omitempty"`
-	CorrelationID     string     `json:"correlation_id"`
-	CreatedAt         time.Time  `json:"created_at"`
-	UpdatedAt         time.Time  `json:"updated_at"`
-	SentAt            *time.Time `json:"sent_at,omitempty"`
+	ID                uuid.UUID      `json:"id"`
+	BatchID           *uuid.UUID     `json:"batch_id,omitempty"`
+	Channel           string         `json:"channel"`
+	Priority          string         `json:"priority"`
+	Recipient         string         `json:"recipient"`
+	Content           string         `json:"content"`
+	TemplateID        *uuid.UUID     `json:"template_id,omitempty"`
+	Variables         map[string]any `json:"variables,omitempty"`
+	Status            string         `json:"status"`
+	Attempts          int            `json:"attempts"`
+	MaxAttempts       int            `json:"max_attempts"`
+	ScheduledAt       *time.Time     `json:"scheduled_at,omitempty"`
+	NextAttemptAt     *time.Time     `json:"next_attempt_at,omitempty"`
+	LastError         *string        `json:"last_error,omitempty"`
+	ProviderMessageID *string        `json:"provider_message_id,omitempty"`
+	IdempotencyKey    *string        `json:"idempotency_key,omitempty"`
+	CorrelationID     string         `json:"correlation_id"`
+	CreatedAt         time.Time      `json:"created_at"`
+	UpdatedAt         time.Time      `json:"updated_at"`
+	SentAt            *time.Time     `json:"sent_at,omitempty"`
 }
 
 func toNotificationResponse(n domain.Notification) notificationResponse {
@@ -63,6 +69,8 @@ func toNotificationResponse(n domain.Notification) notificationResponse {
 		Priority:          string(n.Priority),
 		Recipient:         n.Recipient,
 		Content:           n.Content,
+		TemplateID:        n.TemplateID,
+		Variables:         n.Variables,
 		Status:            string(n.Status),
 		Attempts:          n.Attempts,
 		MaxAttempts:       n.MaxAttempts,
@@ -173,5 +181,31 @@ func toBatchResponse(s domain.BatchSummary, items []domain.Notification, next *s
 		StatusCounts: counts,
 		Items:        toNotificationResponses(items),
 		NextCursor:   next,
+	}
+}
+
+type createTemplateRequest struct {
+	Name    string `json:"name"`
+	Channel string `json:"channel"`
+	Body    string `json:"body"`
+}
+
+type templateResponse struct {
+	ID        uuid.UUID `json:"id"`
+	Name      string    `json:"name"`
+	Channel   string    `json:"channel"`
+	Body      string    `json:"body"`
+	Variables []string  `json:"variables"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+func toTemplateResponse(t notification.TemplateView) templateResponse {
+	vars := t.Variables
+	if vars == nil {
+		vars = []string{}
+	}
+	return templateResponse{
+		ID: t.ID, Name: t.Name, Channel: string(t.Channel), Body: t.Body,
+		Variables: vars, CreatedAt: t.CreatedAt.UTC(),
 	}
 }

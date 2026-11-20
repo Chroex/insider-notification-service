@@ -19,11 +19,13 @@ const MaxIdempotencyKeyLength = 255
 // that omits priority and one that sends "normal" hash identically: they
 // mean the same thing and must not be reported as a conflict.
 type canonicalItem struct {
-	Channel     string  `json:"channel"`
-	Recipient   string  `json:"recipient"`
-	Content     string  `json:"content"`
-	Priority    string  `json:"priority"`
-	ScheduledAt *string `json:"scheduled_at"`
+	Channel     string         `json:"channel"`
+	Recipient   string         `json:"recipient"`
+	Content     string         `json:"content"`
+	Priority    string         `json:"priority"`
+	ScheduledAt *string        `json:"scheduled_at"`
+	TemplateID  *string        `json:"template_id"`
+	Variables   map[string]any `json:"variables"` // json.Marshal sorts map keys: canonical
 }
 
 func canonicalize(in CreateInput) canonicalItem {
@@ -38,6 +40,10 @@ func canonicalize(in CreateInput) canonicalItem {
 		// "2030-01-01T00:00:00Z" are the same instant and hash the same.
 		ts := in.ScheduledAt.UTC().Format(time.RFC3339Nano)
 		c.ScheduledAt = &ts
+	}
+	if in.TemplateID != nil {
+		id := in.TemplateID.String()
+		c.TemplateID, c.Variables = &id, in.Variables
 	}
 	return c
 }

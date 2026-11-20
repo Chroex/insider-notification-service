@@ -22,6 +22,7 @@ servers:
 tags:
   - name: notifications
   - name: batches
+  - name: templates
   - name: observability
   - name: health
 
@@ -55,6 +56,13 @@ paths:
               scheduledEmail:
                 summary: Scheduled email
                 value: { channel: email, recipient: user@example.com, content: 'Weekly digest', scheduled_at: '2030-01-01T09:00:00Z' }
+              fromTemplate:
+                summary: Rendered from a template
+                value:
+                  channel: sms
+                  recipient: '+905551234567'
+                  template_id: 01a1fa60-0000-7000-8000-000000000001
+                  variables: { first_name: Ayşe, order_id: 'TR-1042' }
       responses:
         '201':
           description: Created and enqueued.
@@ -244,6 +252,66 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Batch' }
+        '400': { $ref: '#/components/responses/InvalidParameter' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/v1/templates:
+    post:
+      tags: [templates]
+      summary: Create a message template
+      description: |
+        The body uses Go `text/template` syntax: `Hi {{.first_name}}`. It is
+        compiled on creation (syntax errors are rejected) and the variables it
+        requires are returned. Templates are immutable, so a notification
+        rendered from one never changes meaning later.
+      operationId: createTemplate
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateTemplateRequest' }
+            example:
+              name: order-shipped-sms
+              channel: sms
+              body: 'Hi {{.first_name}}, your order {{.order_id}} has shipped.'
+      responses:
+        '201':
+          description: Created.
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Template' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409':
+          description: A template with this name already exists.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error: { code: template_name_taken, message: a template with this name already exists }
+                correlation_id: 4f6c1f0e-0f43-4b52-9a5e-3d1c2b7f9a10
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/v1/templates/{id}:
+    get:
+      tags: [templates]
+      summary: Get a template and its required variables
+      operationId: getTemplate
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: The template.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Template' }
         '400': { $ref: '#/components/responses/InvalidParameter' }
         '404': { $ref: '#/components/responses/NotFound' }
         '500': { $ref: '#/components/responses/InternalError' }
@@ -445,7 +513,8 @@ components:
     CreateNotificationRequest:
       type: object
       additionalProperties: false
-      required: [channel, recipient, content]
+      required: [channel, recipient]
+      description: Provide either `content`, or `template_id` (+ `variables`).
       properties:
         channel: { $ref: '#/components/schemas/Channel' }
         recipient:
@@ -455,7 +524,18 @@ components:
             (`user@example.com`). `push`: device token (no whitespace, at most 512 chars).
         content:
           type: string
-          description: Required. At most 160 (sms), 10000 (email) or 256 (push) characters.
+          description: |
+            Required unless `template_id` is given. At most 160 (sms), 10000
+            (email) or 256 (push) characters; the same limit applies to rendered
+            template output.
+        template_id:
+          type: string
+          format: uuid
+          description: Render the content from this template (its channel must match).
+        variables:
+          type: object
+          additionalProperties: true
+          description: Values for the template's variables; every required variable must be present.
         priority:
           allOf: [{ $ref: '#/components/schemas/Priority' }]
           default: normal
@@ -485,7 +565,9 @@ components:
         channel: { $ref: '#/components/schemas/Channel' }
         priority: { $ref: '#/components/schemas/Priority' }
         recipient: { type: string }
-        content: { type: string }
+        content: { type: string, description: Final text (rendered when a template was used). }
+        template_id: { type: string, format: uuid }
+        variables: { type: object, additionalProperties: true }
         status: { $ref: '#/components/schemas/Status' }
         attempts: { type: integer, minimum: 0, description: Delivery attempts made so far. }
         max_attempts: { type: integer, minimum: 1 }
@@ -647,6 +729,43 @@ components:
           type: object
           additionalProperties: { $ref: '#/components/schemas/Stats' }
 
+    CreateTemplateRequest:
+      type: object
+      additionalProperties: false
+      required: [name, channel, body]
+      properties:
+        name:
+          type: string
+          pattern: '^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$'
+          description: Unique.
+        channel: { $ref: '#/components/schemas/Channel' }
+        body:
+          type: string
+          maxLength: 20000
+          description: Go text/template syntax, e.g. `Hi {{.first_name}}`.
+
+    Template:
+      type: object
+      additionalProperties: false
+      required: [id, name, channel, body, variables, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        channel: { $ref: '#/components/schemas/Channel' }
+        body: { type: string }
+        variables:
+          type: array
+          items: { type: string }
+          description: Variables the body requires, sorted.
+        created_at: { type: string, format: date-time }
+      example:
+        id: 01a1fa60-0000-7000-8000-000000000001
+        name: order-shipped-sms
+        channel: sms
+        body: 'Hi {{.first_name}}, your order {{.order_id}} has shipped.'
+        variables: [first_name, order_id]
+        created_at: '2026-11-20T18:00:00Z'
+
     FieldError:
       type: object
       additionalProperties: false
@@ -669,7 +788,8 @@ components:
             code:
               type: string
               enum: [invalid_json, invalid_parameter, validation_failed, not_found,
-                     idempotency_conflict, invalid_state, payload_too_large, internal_error]
+                     idempotency_conflict, invalid_state, template_name_taken,
+                     payload_too_large, internal_error]
             message: { type: string }
             details:
               type: array

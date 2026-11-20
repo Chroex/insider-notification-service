@@ -838,3 +838,132 @@ func TestMetricsSummary(t *testing.T) {
 		}
 	}
 }
+
+// --- templates ---
+
+func createTemplate(t *testing.T, name, channel, body string) string {
+	t.Helper()
+	r := call(t, "POST", "/api/v1/templates", map[string]any{"name": name, "channel": channel, "body": body})
+	expectStatus(t, r, http.StatusCreated)
+	return r.Body["id"].(string)
+}
+
+func TestTemplates_CreateAndGet(t *testing.T) {
+	db.Reset(t)
+	r := call(t, "POST", "/api/v1/templates", map[string]any{
+		"name": "order-shipped", "channel": "sms",
+		"body": "Hi {{.first_name}}, order {{.order_id}} has shipped.",
+	})
+	expectStatus(t, r, http.StatusCreated)
+	if fmt.Sprint(r.Body["variables"]) != "[first_name order_id]" {
+		t.Errorf("variables = %v", r.Body["variables"])
+	}
+	got := call(t, "GET", "/api/v1/templates/"+r.Body["id"].(string), nil)
+	expectStatus(t, got, http.StatusOK)
+	if got.Body["name"] != "order-shipped" || got.Body["body"] != r.Body["body"] {
+		t.Errorf("get = %v", got.Body)
+	}
+
+	dup := call(t, "POST", "/api/v1/templates", map[string]any{"name": "order-shipped", "channel": "sms", "body": "x"})
+	expectStatus(t, dup, http.StatusConflict)
+	if errorCode(dup) != "template_name_taken" {
+		t.Errorf("code = %q", errorCode(dup))
+	}
+
+	bad := call(t, "POST", "/api/v1/templates", map[string]any{"name": "", "channel": "fax", "body": "{{.unclosed"})
+	expectStatus(t, bad, http.StatusUnprocessableEntity)
+	if n := len(bad.Body["error"].(map[string]any)["details"].([]any)); n != 3 {
+		t.Errorf("want name, channel and body errors, got %d: %v", n, bad.Body)
+	}
+
+	expectStatus(t, call(t, "GET", "/api/v1/templates/0190a8c4-0000-7000-8000-000000000000", nil), http.StatusNotFound)
+}
+
+func TestTemplates_RenderIntoNotification(t *testing.T) {
+	db.Reset(t)
+	tid := createTemplate(t, "welcome", "email", "Welcome {{.first_name}}! {{if .vip}}Enjoy free shipping.{{end}}")
+
+	r := call(t, "POST", "/api/v1/notifications", map[string]any{
+		"channel": "email", "recipient": "ayse@example.com",
+		"template_id": tid, "variables": map[string]any{"first_name": "Ayşe", "vip": true},
+	})
+	expectStatus(t, r, http.StatusCreated)
+	if r.Body["content"] != "Welcome Ayşe! Enjoy free shipping." || r.Body["template_id"] != tid {
+		t.Errorf("rendered notification = %v", r.Body)
+	}
+	// The stored row holds the final text, so workers never render.
+	var stored string
+	if err := db.Pool.QueryRow(context.Background(), "SELECT content FROM notifications WHERE id = $1",
+		r.Body["id"]).Scan(&stored); err != nil || stored != "Welcome Ayşe! Enjoy free shipping." {
+		t.Errorf("stored content = %q, %v", stored, err)
+	}
+}
+
+func TestTemplates_Rejections(t *testing.T) {
+	db.Reset(t)
+	smsTpl := createTemplate(t, "otp", "sms", "Code {{.code}} for {{.name}}")
+	longTpl := createTemplate(t, "long", "sms", "{{.text}} - from Insider")
+
+	tests := []struct {
+		name      string
+		body      map[string]any
+		wantField string
+	}{
+		{"missing variables listed", map[string]any{"channel": "sms", "recipient": "+905551234567",
+			"template_id": smsTpl, "variables": map[string]any{"name": "x"}}, "variables"},
+		{"channel mismatch", map[string]any{"channel": "push", "recipient": "tok",
+			"template_id": smsTpl, "variables": map[string]any{"code": 1, "name": "x"}}, "template_id"},
+		{"unknown template", map[string]any{"channel": "sms", "recipient": "+905551234567",
+			"template_id": "0190a8c4-0000-7000-8000-000000000000"}, "template_id"},
+		{"content and template", map[string]any{"channel": "sms", "recipient": "+905551234567", "content": "hi",
+			"template_id": smsTpl, "variables": map[string]any{"code": 1, "name": "x"}}, "content"},
+		{"variables without template", map[string]any{"channel": "sms", "recipient": "+905551234567",
+			"content": "hi", "variables": map[string]any{"a": 1}}, "variables"},
+		{"rendered output too long for sms", map[string]any{"channel": "sms", "recipient": "+905551234567",
+			"template_id": longTpl, "variables": map[string]any{"text": strings.Repeat("x", 150)}}, "content"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := call(t, "POST", "/api/v1/notifications", tt.body)
+			expectStatus(t, r, http.StatusUnprocessableEntity)
+			details := r.Body["error"].(map[string]any)["details"].([]any)
+			if len(details) != 1 || details[0].(map[string]any)["field"] != tt.wantField {
+				t.Errorf("details = %v, want exactly one %q error", details, tt.wantField)
+			}
+		})
+	}
+	r := call(t, "POST", "/api/v1/notifications", tests[0].body)
+	if msg := r.Body["error"].(map[string]any)["details"].([]any)[0].(map[string]any)["message"]; msg != "missing required variables: code" {
+		t.Errorf("message = %v", msg)
+	}
+}
+
+func TestTemplates_InBatchAndIdempotency(t *testing.T) {
+	db.Reset(t)
+	tid := createTemplate(t, "flash", "push", "{{.first_name}}, flash sale ends at {{.hour}}:00!")
+	item := func(name string) map[string]any {
+		return map[string]any{"channel": "push", "recipient": "tok-" + name, "template_id": tid,
+			"variables": map[string]any{"first_name": name, "hour": 18}}
+	}
+	bad := map[string]any{"channel": "push", "recipient": "tok-x", "template_id": tid,
+		"variables": map[string]any{"first_name": "x"}}
+
+	r := call(t, "POST", "/api/v1/notifications/batch", map[string]any{"notifications": []any{item("Can"), bad}})
+	expectStatus(t, r, http.StatusUnprocessableEntity)
+	if d := r.Body["error"].(map[string]any)["details"].([]any)[0].(map[string]any); d["index"] != 1.0 || d["field"] != "variables" {
+		t.Errorf("batch template error = %v", d)
+	}
+
+	body := map[string]any{"notifications": []any{item("Can"), item("Elif")}}
+	first := call(t, "POST", "/api/v1/notifications/batch", body, "Idempotency-Key", "flash-1")
+	expectStatus(t, first, http.StatusCreated)
+	expectStatus(t, call(t, "POST", "/api/v1/notifications/batch", body, "Idempotency-Key", "flash-1"), http.StatusOK)
+
+	changed := map[string]any{"notifications": []any{item("Can"), item("Deniz")}}
+	expectStatus(t, call(t, "POST", "/api/v1/notifications/batch", changed, "Idempotency-Key", "flash-1"), http.StatusConflict)
+
+	id := first.Body["items"].([]any)[1].(map[string]any)["id"].(string)
+	if got := call(t, "GET", "/api/v1/notifications/"+id, nil).Body["content"]; got != "Elif, flash sale ends at 18:00!" {
+		t.Errorf("content = %v", got)
+	}
+}

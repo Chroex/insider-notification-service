@@ -30,6 +30,8 @@ type Store interface {
 	ListBatchItems(ctx context.Context, batchID uuid.UUID, limit int, after *store.Cursor) ([]domain.Notification, *store.Cursor, error)
 	ListBatchItemIDs(ctx context.Context, batchID uuid.UUID) ([]uuid.UUID, error)
 	Summary(ctx context.Context, since time.Time) (store.Summary, error)
+	InsertTemplate(ctx context.Context, t domain.Template) (domain.Template, error)
+	GetTemplate(ctx context.Context, id uuid.UUID) (domain.Template, error)
 }
 
 // Config holds the service's limits.
@@ -64,6 +66,10 @@ type CreateInput struct {
 	Content     string
 	Priority    string
 	ScheduledAt *time.Time
+	// TemplateID + Variables replace Content: the template is rendered at
+	// create time and the result stored as content.
+	TemplateID *uuid.UUID
+	Variables  map[string]any
 }
 
 // Create validates and enqueues one notification. created is false when the
@@ -73,7 +79,11 @@ func (s *Service) Create(ctx context.Context, in CreateInput, idempotencyKey, co
 	if err != nil {
 		return domain.Notification{}, false, err
 	}
-	if fieldErrs := s.cfg.Rules.Validate(toValidationRequest(in), s.now()); len(fieldErrs) > 0 {
+	fieldErrs, err := s.validateInput(ctx, &in, templateCache{})
+	if err != nil {
+		return domain.Notification{}, false, err
+	}
+	if len(fieldErrs) > 0 {
 		return domain.Notification{}, false, &domain.ValidationError{Fields: fieldErrs}
 	}
 
@@ -106,6 +116,8 @@ func (s *Service) build(in CreateInput, correlationID string) domain.Notificatio
 		Priority:      EffectivePriority(in.Priority),
 		Recipient:     in.Recipient,
 		Content:       in.Content,
+		TemplateID:    in.TemplateID,
+		Variables:     in.Variables,
 		Status:        domain.StatusPending,
 		MaxAttempts:   s.cfg.MaxAttempts,
 		NextAttemptAt: now,
@@ -134,7 +146,7 @@ func (s *Service) CreateBatch(ctx context.Context, items []CreateInput, idempote
 	if err != nil {
 		return BatchResult{}, false, err
 	}
-	if err := s.validateBatch(items); err != nil {
+	if err := s.validateBatch(ctx, items); err != nil {
 		return BatchResult{}, false, err
 	}
 
@@ -173,17 +185,23 @@ func (s *Service) CreateBatch(ctx context.Context, items []CreateInput, idempote
 	return BatchResult{Batch: stored, IDs: originalIDs}, false, nil
 }
 
-func (s *Service) validateBatch(items []CreateInput) error {
+// validateBatch renders templates in place (items[i].Content) and reports
+// every failing item by index.
+func (s *Service) validateBatch(ctx context.Context, items []CreateInput) error {
 	if len(items) == 0 || len(items) > s.cfg.BatchMaxSize {
 		return &domain.ValidationError{Fields: []domain.FieldError{{
 			Field:   "notifications",
 			Message: fmt.Sprintf("must contain between 1 and %d items, got %d", s.cfg.BatchMaxSize, len(items)),
 		}}}
 	}
-	now := s.now()
+	cache := templateCache{}
 	var all []domain.FieldError
-	for i, in := range items {
-		for _, fe := range s.cfg.Rules.Validate(toValidationRequest(in), now) {
+	for i := range items {
+		errs, err := s.validateInput(ctx, &items[i], cache)
+		if err != nil {
+			return err
+		}
+		for _, fe := range errs {
 			fe.Index = &i
 			all = append(all, fe)
 		}

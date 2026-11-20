@@ -182,6 +182,38 @@ func (h *handlers) getBatch(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, toBatchResponse(summary, items, encodeCursor(next)))
 }
 
+// POST /api/v1/templates
+func (h *handlers) createTemplate(w http.ResponseWriter, r *http.Request) {
+	var req createTemplateRequest
+	if reqErr := decodeJSON(w, r, &req, maxSingleBodyBytes); reqErr != nil {
+		writeError(w, r, reqErr.status, reqErr.code, reqErr.message, nil)
+		return
+	}
+	t, err := h.svc.CreateTemplate(r.Context(), notification.TemplateInput{
+		Name: req.Name, Channel: req.Channel, Body: req.Body,
+	})
+	if err != nil {
+		writeServiceError(w, r, err)
+		return
+	}
+	w.Header().Set("Location", "/api/v1/templates/"+t.ID.String())
+	writeJSON(w, http.StatusCreated, toTemplateResponse(t))
+}
+
+// GET /api/v1/templates/{id}
+func (h *handlers) getTemplate(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r)
+	if !ok {
+		return
+	}
+	t, err := h.svc.GetTemplate(r.Context(), id)
+	if err != nil {
+		writeServiceError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, toTemplateResponse(t))
+}
+
 // notFound returns the standard error body for unknown routes.
 func notFound(w http.ResponseWriter, r *http.Request) {
 	writeError(w, r, http.StatusNotFound, codeNotFound, "no route for "+r.Method+" "+r.URL.Path, nil)

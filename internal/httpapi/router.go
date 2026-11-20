@@ -70,6 +70,8 @@ func (h *handlers) routes() []route {
 		{"POST /api/v1/notifications/{id}/retry", h.retryNotification},
 		{"GET /api/v1/batches/{id}", h.getBatch},
 		{"GET /api/v1/metrics/summary", h.metricsSummary},
+		{"POST /api/v1/templates", h.createTemplate},
+		{"GET /api/v1/templates/{id}", h.getTemplate},
 	}
 }
 

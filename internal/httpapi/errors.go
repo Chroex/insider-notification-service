@@ -15,6 +15,7 @@ const (
 	codeValidationFailed    = "validation_failed"
 	codeNotFound            = "not_found"
 	codeIdempotencyConflict = "idempotency_conflict"
+	codeTemplateNameTaken   = "template_name_taken"
 	codeInvalidState        = "invalid_state"
 	codePayloadTooLarge     = "payload_too_large"
 	codeInternal            = "internal_error"
@@ -55,6 +56,8 @@ func writeServiceError(w http.ResponseWriter, r *http.Request, err error) {
 	case errors.Is(err, domain.ErrIdempotencyConflict):
 		writeError(w, r, http.StatusConflict, codeIdempotencyConflict,
 			"Idempotency-Key was already used with a different request payload", nil)
+	case errors.Is(err, domain.ErrTemplateNameTaken):
+		writeError(w, r, http.StatusConflict, codeTemplateNameTaken, "a template with this name already exists", nil)
 	case errors.As(err, &transitionErr):
 		writeError(w, r, http.StatusConflict, codeInvalidState, transitionErr.Error(), nil)
 	default:
