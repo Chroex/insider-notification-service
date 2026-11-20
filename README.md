@@ -427,6 +427,12 @@ fake provider, so they are deterministic. They cover:
 - **every API response is validated against `api/openapi.yaml`**, and a unit
   test fails if the router and the spec list different endpoints
 
+**CI** ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs on every push and
+pull request: `go vet` + golangci-lint, unit + integration tests with `-race`
+(testcontainers on the GitHub runner), a Docker build of each image target,
+and an end-to-end job that runs `docker compose up`, seeds a batch and waits
+for deliveries.
+
 If Docker Desktop cannot pull testcontainers' helper image (Ryuk), run
 `TESTCONTAINERS_RYUK_DISABLED=true make test`; the tests remove their own
 containers.
