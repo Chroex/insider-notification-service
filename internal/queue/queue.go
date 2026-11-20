@@ -178,8 +178,9 @@ func (q *Queue) Release(ctx context.Context, jobs []domain.Notification) (int64,
 
 // ReapResult counts what the reaper did.
 type ReapResult struct {
-	Requeued int
-	Failed   int
+	Requeued        int
+	Failed          int
+	FailedByChannel map[domain.Channel]int
 }
 
 // ReapExpired is crash recovery. A row still 'processing' after its lease
@@ -201,20 +202,22 @@ func (q *Queue) ReapExpired(ctx context.Context) (ReapResult, error) {
 		    locked_until = NULL,
 		    next_attempt_at = now()
 		WHERE status = 'processing' AND locked_until < now()
-		RETURNING status`)
+		RETURNING status, channel`)
 	if err != nil {
 		return ReapResult{}, fmt.Errorf("reap: %w", err)
 	}
 	defer rows.Close()
 
-	var res ReapResult
+	res := ReapResult{FailedByChannel: map[domain.Channel]int{}}
 	for rows.Next() {
 		var status domain.Status
-		if err := rows.Scan(&status); err != nil {
+		var channel domain.Channel
+		if err := rows.Scan(&status, &channel); err != nil {
 			return ReapResult{}, fmt.Errorf("reap: scan: %w", err)
 		}
 		if status == domain.StatusFailed {
 			res.Failed++
+			res.FailedByChannel[channel]++
 		} else {
 			res.Requeued++
 		}
