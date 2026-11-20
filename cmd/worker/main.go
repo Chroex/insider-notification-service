@@ -14,9 +14,13 @@ import (
 	"time"
 
 	"notification-service/internal/config"
+	"notification-service/internal/domain"
 	"notification-service/internal/health"
 	"notification-service/internal/observability"
 	"notification-service/internal/platform"
+	"notification-service/internal/provider"
+	"notification-service/internal/queue"
+	"notification-service/internal/worker"
 )
 
 func main() {
@@ -59,10 +63,42 @@ func run() error {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	// The dispatcher (claim -> rate limit -> send -> record) is added in a
-	// later phase; for now the worker only exposes its admin endpoints.
-	if err := platform.RunHTTPServer(ctx, srv, cfg.ShutdownTimeout, log); err != nil {
-		return fmt.Errorf("worker admin: %w", err)
+	engine := worker.New(
+		queue.New(db),
+		provider.NewClient(cfg.ProviderURL, cfg.Worker.ProviderTimeout),
+		worker.Config{
+			Channels:        domain.Channels,
+			Concurrency:     cfg.Worker.Concurrency,
+			ClaimBatchSize:  cfg.Worker.ClaimBatchSize,
+			PollInterval:    cfg.Worker.PollInterval,
+			LeaseDuration:   cfg.Worker.LeaseDuration,
+			ReaperInterval:  cfg.Worker.ReaperInterval,
+			ShutdownTimeout: cfg.ShutdownTimeout,
+			Policy:          worker.RetryPolicy{BaseDelay: cfg.Worker.RetryBaseDelay},
+		},
+		log,
+	)
+
+	engineDone := make(chan struct{})
+	go func() {
+		defer close(engineDone)
+		engine.Run(ctx)
+	}()
+
+	// The admin server outlives the signal: it keeps answering health checks
+	// while the engine drains, and stops only once the engine is done.
+	serverCtx, stopServer := context.WithCancel(context.Background())
+	go func() {
+		<-engineDone
+		stopServer()
+	}()
+	serverErr := platform.RunHTTPServer(serverCtx, srv, cfg.ShutdownTimeout, log)
+	if serverErr != nil {
+		stop() // e.g. port in use: shut the engine down too instead of running headless
+	}
+	<-engineDone
+	if serverErr != nil {
+		return fmt.Errorf("worker admin: %w", serverErr)
 	}
 	log.Info("worker stopped cleanly")
 	return nil
