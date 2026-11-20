@@ -16,6 +16,7 @@ const (
 	KeyChannel        = "channel"
 	KeyAttempt        = "attempt"
 	KeyService        = "service"
+	KeyTraceID        = "trace_id"
 )
 
 // NewLogger returns a JSON slog logger tagged with the service name.
