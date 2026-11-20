@@ -31,7 +31,7 @@ func canonicalize(in CreateInput) canonicalItem {
 		Channel:   in.Channel,
 		Recipient: in.Recipient,
 		Content:   in.Content,
-		Priority:  string(effectivePriority(in.Priority)),
+		Priority:  string(EffectivePriority(in.Priority)),
 	}
 	if in.ScheduledAt != nil {
 		// UTC + fixed format: "2030-01-01T03:00:00+03:00" and
@@ -83,7 +83,8 @@ func normalizeKey(raw string) (*string, error) {
 	return &key, nil
 }
 
-func effectivePriority(raw string) domain.Priority {
+// EffectivePriority applies the default priority (normal) to an empty value.
+func EffectivePriority(raw string) domain.Priority {
 	if raw == "" {
 		return domain.PriorityNormal
 	}

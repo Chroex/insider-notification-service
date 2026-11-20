@@ -56,10 +56,15 @@ func run() error {
 		BatchMaxSize: cfg.BatchMaxSize,
 		MaxAttempts:  cfg.MaxAttempts,
 	})
-	router := httpapi.NewRouter(svc, log,
-		health.Check{Name: "postgres", Ping: db.Ping},
-		health.Check{Name: "redis", Ping: func(ctx context.Context) error { return rdb.Ping(ctx).Err() }},
-	)
+	router := httpapi.NewRouter(httpapi.Options{
+		Service:  svc,
+		Logger:   log,
+		Registry: observability.NewRegistry(),
+		Checks: []health.Check{
+			{Name: "postgres", Ping: db.Ping},
+			{Name: "redis", Ping: func(ctx context.Context) error { return rdb.Ping(ctx).Err() }},
+		},
+	})
 
 	srv := &http.Server{
 		Addr:              cfg.APIAddr,

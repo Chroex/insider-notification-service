@@ -24,7 +24,8 @@ const (
 )
 
 type handlers struct {
-	svc *notification.Service
+	svc     *notification.Service
+	metrics *observability.APIMetrics
 }
 
 // POST /api/v1/notifications
@@ -43,6 +44,9 @@ func (h *handlers) createNotification(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Location", "/api/v1/notifications/"+n.ID.String())
+	if created {
+		h.metrics.NotificationCreated(n.Channel, n.Priority)
+	}
 	if !created {
 		w.Header().Set(headerReplayed, "true")
 		writeJSON(w, http.StatusOK, toNotificationResponse(n))
@@ -82,6 +86,11 @@ func (h *handlers) createBatch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Location", "/api/v1/batches/"+result.Batch.ID.String())
+	if created {
+		for _, in := range inputs {
+			h.metrics.NotificationCreated(domain.Channel(in.Channel), notification.EffectivePriority(in.Priority))
+		}
+	}
 	if !created {
 		w.Header().Set(headerReplayed, "true")
 		writeJSON(w, http.StatusOK, resp)

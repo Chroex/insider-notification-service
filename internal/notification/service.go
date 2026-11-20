@@ -29,6 +29,7 @@ type Store interface {
 	GetBatchSummary(ctx context.Context, id uuid.UUID) (domain.BatchSummary, error)
 	ListBatchItems(ctx context.Context, batchID uuid.UUID, limit int, after *store.Cursor) ([]domain.Notification, *store.Cursor, error)
 	ListBatchItemIDs(ctx context.Context, batchID uuid.UUID) ([]uuid.UUID, error)
+	Summary(ctx context.Context, since time.Time) (store.Summary, error)
 }
 
 // Config holds the service's limits.
@@ -102,7 +103,7 @@ func (s *Service) build(in CreateInput, correlationID string) domain.Notificatio
 		ID:            s.newID(),
 		CorrelationID: correlationID,
 		Channel:       domain.Channel(in.Channel),
-		Priority:      effectivePriority(in.Priority),
+		Priority:      EffectivePriority(in.Priority),
 		Recipient:     in.Recipient,
 		Content:       in.Content,
 		Status:        domain.StatusPending,
@@ -221,6 +222,11 @@ func (s *Service) Cancel(ctx context.Context, id uuid.UUID) (domain.Notification
 // "redrive" for them once the cause (bad config, provider outage) is fixed.
 func (s *Service) Retry(ctx context.Context, id uuid.UUID) (domain.Notification, error) {
 	return s.store.RetryNotification(ctx, id, s.cfg.MaxAttempts)
+}
+
+// Summary returns queue depth and delivery statistics for the last window.
+func (s *Service) Summary(ctx context.Context, window time.Duration) (store.Summary, error) {
+	return s.store.Summary(ctx, s.now().Add(-window))
 }
 
 // GetBatch returns a batch summary and one page of its items.

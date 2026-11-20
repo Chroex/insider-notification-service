@@ -91,6 +91,27 @@ func recoverer(next http.Handler) http.Handler {
 	})
 }
 
+// httpMetrics records request count and latency per route pattern.
+//
+// It must be the innermost middleware: ServeMux stores the matched pattern
+// in r.Pattern on the *same* *http.Request it was given, and outer
+// middleware hand it a copy (r.WithContext). Labelling by pattern, never by
+// raw path, keeps cardinality bounded (paths contain notification ids).
+func httpMetrics(m *observability.APIMetrics) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
+			rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+			next.ServeHTTP(rec, r)
+			route := r.Pattern
+			if route == "" {
+				route = "unmatched"
+			}
+			m.ObserveHTTP(r.Method, route, rec.status, time.Since(start))
+		})
+	}
+}
+
 // chain applies middleware so the first one listed is the outermost.
 func chain(h http.Handler, mws ...func(http.Handler) http.Handler) http.Handler {
 	for i := len(mws) - 1; i >= 0; i-- {

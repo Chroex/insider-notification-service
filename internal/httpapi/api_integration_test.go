@@ -42,7 +42,10 @@ func TestMain(m *testing.M) {
 	svc := notification.NewService(store.New(db.Pool), notification.Config{
 		Rules: validation.DefaultRules, BatchMaxSize: 1000, MaxAttempts: 5,
 	})
-	server = httptest.NewServer(httpapi.NewRouter(svc, slog.New(slog.NewTextHandler(io.Discard, nil))))
+	server = httptest.NewServer(httpapi.NewRouter(httpapi.Options{
+		Service: svc,
+		Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}))
 
 	code := m.Run()
 	server.Close()
@@ -614,4 +617,162 @@ func TestRetry_OnlyFromFailed(t *testing.T) {
 	}
 	r := call(t, "POST", "/api/v1/notifications/0190a8c4-0000-7000-8000-000000000000/retry", nil)
 	expectStatus(t, r, http.StatusNotFound)
+}
+
+// --- observability ---
+
+func getText(t *testing.T, path string) string {
+	t.Helper()
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, server.URL+path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	b, _ := io.ReadAll(resp.Body)
+	return string(b)
+}
+
+// metricValue returns the value of one exact series line in /metrics output
+// (0 if absent).
+func metricValue(t *testing.T, body, series string) float64 {
+	t.Helper()
+	for _, line := range strings.Split(body, "\n") {
+		if strings.HasPrefix(line, series+" ") {
+			var v float64
+			if _, err := fmt.Sscanf(strings.TrimPrefix(line, series+" "), "%g", &v); err != nil {
+				t.Fatalf("parse %q: %v", line, err)
+			}
+			return v
+		}
+	}
+	return 0
+}
+
+func TestMetricsEndpoint(t *testing.T) {
+	db.Reset(t)
+	const created = `notifications_created_total{channel="email",priority="low"}`
+	const posted = `http_requests_total{method="POST",route="POST /api/v1/notifications",status="201"}`
+	before := getText(t, "/metrics")
+
+	body := map[string]any{"channel": "email", "recipient": "m@example.com", "content": "hi", "priority": "low"}
+	first := call(t, "POST", "/api/v1/notifications", body, "Idempotency-Key", "metrics-1")
+	call(t, "POST", "/api/v1/notifications", body, "Idempotency-Key", "metrics-1") // replay: not counted
+	call(t, "POST", "/api/v1/notifications/batch", map[string]any{"notifications": []any{body, body}})
+	call(t, "GET", "/api/v1/notifications/"+first.Body["id"].(string), nil)
+
+	after := getText(t, "/metrics")
+	if d := metricValue(t, after, created) - metricValue(t, before, created); d != 3 {
+		t.Errorf("created delta = %v, want 3 (1 single + 2 batch, replay excluded)", d)
+	}
+	if d := metricValue(t, after, posted) - metricValue(t, before, posted); d != 1 {
+		t.Errorf("POST 201 delta = %v, want 1", d)
+	}
+	if !strings.Contains(after, `route="GET /api/v1/notifications/{id}"`) {
+		t.Error("GET by id should be labelled with the route pattern")
+	}
+	if strings.Contains(after, first.Body["id"].(string)) {
+		t.Error("a notification id leaked into metric labels (unbounded cardinality)")
+	}
+	if !strings.Contains(after, "go_goroutines") {
+		t.Error("runtime collectors missing")
+	}
+}
+
+func TestMetricsSummary(t *testing.T) {
+	db.Reset(t)
+	ctx := context.Background()
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := db.Pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insert := func(channel, status string, ageMS int, sent bool) string {
+		t.Helper()
+		var id string
+		sentAt := "NULL"
+		if sent {
+			sentAt = "now()"
+		}
+		if err := db.Pool.QueryRow(ctx, `
+			INSERT INTO notifications (correlation_id, channel, recipient, content, status, attempts,
+				created_at, sent_at, next_attempt_at)
+			VALUES ('c', $1, 'r', 'x', $2, 1, now() - $3 * interval '1 millisecond', `+sentAt+`, now())
+			RETURNING id`, channel, status, ageMS).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	attempt := func(id string, durationMS int, outcome string, age string) {
+		exec(`INSERT INTO delivery_attempts (notification_id, attempt_no, started_at, duration_ms, outcome)
+			VALUES ($1, (SELECT count(*) + 1 FROM delivery_attempts WHERE notification_id = $1),
+			        now() - $4::interval, $2, $3)`, id, durationMS, outcome, age)
+	}
+
+	// In the window: 4 sms sent (end-to-end 1s..4s) and 1 failed.
+	durations := []int{10, 20, 30, 40}
+	for i := range 4 {
+		id := insert("sms", "sent", (i+1)*1000, true)
+		attempt(id, durations[i], "success", "1 minute")
+	}
+	failed := insert("sms", "failed", 0, false)
+	attempt(failed, 1000, "permanent_error", "1 minute")
+	// Queue: 2 pending email, 1 retrying push.
+	insert("email", "pending", 0, false)
+	insert("email", "pending", 0, false)
+	insert("push", "retrying", 0, false)
+	// Outside the 1h window: must be ignored.
+	old := insert("sms", "sent", 0, true)
+	exec(`UPDATE notifications SET sent_at = now() - interval '2 hours' WHERE id = $1`, old)
+	attempt(old, 99999, "success", "2 hours")
+
+	r := call(t, "GET", "/api/v1/metrics/summary?window=1h", nil)
+	expectStatus(t, r, http.StatusOK)
+	overall := r.Body["overall"].(map[string]any)
+	attempts := overall["attempts"].(map[string]any)
+	provider := overall["provider_latency_ms"].(map[string]any)
+	e2e := overall["end_to_end_latency_ms"].(map[string]any)
+
+	// percentile_cont over [10,20,30,40,1000]: p50 = 30, p95 = 40 + 0.8*960 = 808.
+	// End-to-end over [1000,2000,3000,4000]: p50 = 2500, p95 = 3000 + 0.85*1000 = 3850.
+	checks := map[string][2]any{
+		"sent":                  {overall["sent"], 4.0},
+		"failed":                {overall["failed"], 1.0},
+		"success_rate":          {overall["success_rate"], 0.8},
+		"attempts.total":        {attempts["total"], 5.0},
+		"attempts.permanent":    {attempts["permanent_error"], 1.0},
+		"attempts.success_rate": {attempts["success_rate"], 0.8},
+		"provider.p50":          {provider["p50"], 30.0},
+		"provider.p95":          {provider["p95"], 808.0},
+		"e2e.p50":               {e2e["p50"], 2500.0},
+		"e2e.p95":               {e2e["p95"], 3850.0},
+		"window":                {r.Body["window"], "1h0m0s"},
+	}
+	for name, c := range checks {
+		if c[0] != c[1] {
+			t.Errorf("%s = %v, want %v", name, c[0], c[1])
+		}
+	}
+
+	email := r.Body["by_channel"].(map[string]any)["email"].(map[string]any)
+	if email["success_rate"] != nil || email["provider_latency_ms"].(map[string]any)["p50"] != nil {
+		t.Errorf("email has no data in the window; rates and latencies must be null: %v", email)
+	}
+	depth := r.Body["queue_depth"].(map[string]any)
+	byChannel := depth["by_channel"].(map[string]any)
+	if depth["total"] != 3.0 ||
+		byChannel["email"].(map[string]any)["pending"] != 2.0 ||
+		byChannel["push"].(map[string]any)["retrying"] != 1.0 {
+		t.Errorf("queue_depth = %v", depth)
+	}
+
+	for _, bad := range []string{"soon", "10s", "800h"} {
+		if r := call(t, "GET", "/api/v1/metrics/summary?window="+bad, nil); r.Status != http.StatusBadRequest {
+			t.Errorf("window=%s: status %d, want 400", bad, r.Status)
+		}
+	}
 }
