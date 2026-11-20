@@ -65,3 +65,14 @@ type BatchSummary struct {
 	Batch
 	StatusCounts map[Status]int
 }
+
+// QueueBucket identifies one queue-depth series: how many notifications of a
+// channel and priority are currently in a non-terminal status.
+type QueueBucket struct {
+	Channel  Channel
+	Priority Priority
+	Status   Status
+}
+
+// ActiveStatuses are the non-terminal statuses that make up queue depth.
+var ActiveStatuses = []Status{StatusScheduled, StatusPending, StatusProcessing, StatusRetrying}
