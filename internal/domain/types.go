@@ -36,6 +36,19 @@ const (
 
 var Priorities = []Priority{PriorityHigh, PriorityNormal, PriorityLow}
 
+// Rank orders priorities for claiming: lower is claimed first. It mirrors
+// the priority_rank generated column in the notifications table.
+func (p Priority) Rank() int {
+	switch p {
+	case PriorityHigh:
+		return 0
+	case PriorityNormal:
+		return 1
+	default:
+		return 2
+	}
+}
+
 func (p Priority) Valid() bool {
 	switch p {
 	case PriorityHigh, PriorityNormal, PriorityLow:
