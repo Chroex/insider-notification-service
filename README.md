@@ -193,7 +193,8 @@ real provider can use to deduplicate ([ADR-018](docs/DECISIONS.md#adr-018-leases
 - **Exhaustion:** `failed` with `last_error`. Failed notifications are the
   dead-letter set (`GET /api/v1/notifications?status=failed`).
   `POST /api/v1/notifications/{id}/retry` re-queues one with a fresh budget.
-- **Circuit breaker (per channel):** 5 consecutive retryable failures open it.
+- **Circuit breaker (per channel):** 5 consecutive retryable failures from
+  distinct notifications (no more than 1 minute apart) open it.
   For 30s nothing is claimed on that channel, so queued notifications keep
   their attempts; then a single probe decides whether to close it again. A 4xx
   doesn't count against the provider: it answered.
@@ -384,7 +385,8 @@ problem listed in one error.
 | `RETRY_BASE_DELAY` | `2s` | worker | Backoff ceiling after the first failure |
 | `RETRY_BACKOFF_FACTOR` | `2` | worker | Ceiling multiplier per failed attempt |
 | `RETRY_MAX_DELAY` | `5m` | worker | Backoff ceiling cap |
-| `BREAKER_FAILURE_THRESHOLD` | `5` | worker | Consecutive retryable failures that open a channel's breaker |
+| `BREAKER_FAILURE_THRESHOLD` | `5` | worker | Consecutive retryable failures (distinct notifications) that open a channel's breaker |
+| `BREAKER_FAILURE_WINDOW` | `1m` | worker | Failures further apart than this don't count as consecutive |
 | `BREAKER_COOLDOWN` | `30s` | worker | How long an open breaker pauses the channel |
 | `RATE_LIMIT_SMS_PER_SECOND` | `100` | worker | SMS rate across all replicas |
 | `RATE_LIMIT_EMAIL_PER_SECOND` | `100` | worker | Email rate across all replicas |

@@ -37,7 +37,7 @@ const breakerNoLimit = -1
 
 // Breaker stops a channel from hammering a provider that is failing.
 //
-//	closed --(threshold consecutive retryable failures)--> open
+//	closed --(threshold consecutive retryable failures, see below)--> open
 //	open   --(cooldown elapsed)--> half_open (one probe allowed)
 //	half_open --(probe succeeds)--> closed
 //	half_open --(probe fails)-----> open (cooldown restarts)
@@ -47,26 +47,38 @@ const breakerNoLimit = -1
 // traffic slows the provider's recovery. While the breaker is open nothing
 // is claimed, so notifications simply stay queued and lose no attempts.
 //
-// Only retryable failures (5xx, 429, timeouts, network) count. A permanent
-// 4xx means the provider is up and judged that one request bad, so it
-// resets the streak like a success.
+// What counts as "threshold consecutive failures":
+//   - Only retryable failures (5xx, 429, timeouts, network). A permanent 4xx
+//     means the provider is up and judged that one request bad, so it resets
+//     the streak like a success.
+//   - They must come from threshold DISTINCT notifications. One poison
+//     message that always gets a 503 would otherwise open the breaker on
+//     its own through its retries, pausing the whole channel at low traffic.
+//   - Failures more than `window` apart are not consecutive. Without this, a
+//     streak left over from an hour ago plus two fresh failures would open
+//     the breaker. (Both cases were found by the end-to-end run; see ADR-024.)
 type Breaker struct {
 	threshold int
+	window    time.Duration
 	cooldown  time.Duration
 	now       func() time.Time
 	onChange  func(from, to BreakerState)
 
-	mu       sync.Mutex
-	state    BreakerState
-	failures int // consecutive retryable failures while closed
-	openedAt time.Time
-	probing  bool // half-open probe permit handed out and not yet resolved
+	mu          sync.Mutex
+	state       BreakerState
+	failing     map[string]struct{} // distinct notifications in the current failure streak
+	lastFailure time.Time
+	openedAt    time.Time
+	probing     bool // half-open probe permit handed out and not yet resolved
 }
 
 // NewBreaker builds a closed breaker. onChange (optional) is called after
 // every state transition, outside the lock.
-func NewBreaker(threshold int, cooldown time.Duration, onChange func(from, to BreakerState)) *Breaker {
-	return &Breaker{threshold: threshold, cooldown: cooldown, now: time.Now, onChange: onChange}
+func NewBreaker(threshold int, window, cooldown time.Duration, onChange func(from, to BreakerState)) *Breaker {
+	return &Breaker{
+		threshold: threshold, window: window, cooldown: cooldown,
+		now: time.Now, onChange: onChange, failing: map[string]struct{}{},
+	}
 }
 
 // Permits reports how many new sends may start: breakerNoLimit when closed,
@@ -108,8 +120,9 @@ func (b *Breaker) ReleaseProbe() {
 	}
 }
 
-// Record feeds the outcome of one provider call into the breaker.
-func (b *Breaker) Record(outcome domain.AttemptOutcome) {
+// Record feeds the outcome of one provider call into the breaker. key
+// identifies the notification, so retries of the same one count once.
+func (b *Breaker) Record(outcome domain.AttemptOutcome, key string) {
 	failed := outcome == domain.OutcomeRetryableError
 
 	b.mu.Lock()
@@ -117,11 +130,16 @@ func (b *Breaker) Record(outcome domain.AttemptOutcome) {
 	switch b.state {
 	case BreakerClosed:
 		if !failed {
-			b.failures = 0
+			clear(b.failing)
 			break
 		}
-		b.failures++
-		if b.failures >= b.threshold {
+		now := b.now()
+		if now.Sub(b.lastFailure) > b.window {
+			clear(b.failing) // the previous streak went quiet: start over
+		}
+		b.lastFailure = now
+		b.failing[key] = struct{}{}
+		if len(b.failing) >= b.threshold {
 			to = BreakerOpen
 		}
 	case BreakerHalfOpen:
@@ -137,7 +155,7 @@ func (b *Breaker) Record(outcome domain.AttemptOutcome) {
 	}
 	if to != from {
 		b.state = to
-		b.failures = 0
+		clear(b.failing)
 		if to == BreakerOpen {
 			b.openedAt = b.now()
 		}

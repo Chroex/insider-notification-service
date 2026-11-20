@@ -691,10 +691,27 @@ A breaker shared in Redis would open everywhere at once, but it adds a Redis
 dependency to every send decision, and a cross-replica race on the half-open
 probe. Worth it only at large replica counts.
 
+**Revision: what "consecutive" means (found by the end-to-end run).** The
+first version counted any N retryable failures in a row. Running the e2e
+scenario against a long-lived worker opened the email breaker after just two
+fresh failures. There were two reasons:
+1. *Stale streaks:* failures from a much earlier run (with no email successes
+   since) were still counted, so two new ones reached the threshold.
+2. *Poison messages:* a single notification that always gets a 503 produces N
+   "consecutive failures" from its own retries and pauses the whole channel,
+   though the provider is fine for everyone else.
+
+The fix: the streak counts **distinct notifications**, and failures more than
+`BREAKER_FAILURE_WINDOW` (1m) apart start a new streak. A real outage
+fails many different notifications within milliseconds, so it still trips
+the breaker immediately (the integration test still opens it at exactly 3
+calls). Both cases have regression tests.
+
 **Alternatives.** Failure-*rate* windows (e.g. open at >50% failures over 20
-calls, as Hystrix and resilience4j do) are more robust to interleaved
-successes, but harder to reason about and test. Consecutive failures are
-enough for a single upstream per channel.
+calls with a minimum volume, as Hystrix and resilience4j do) are more robust
+to interleaved successes, but harder to reason about and test. A
+consecutive-distinct-failures streak with a time window is enough for a single
+upstream per channel.
 
 ---
 

@@ -80,6 +80,7 @@ type Worker struct {
 	// Circuit breaker: after BreakerThreshold consecutive retryable failures
 	// on a channel, stop sending on it for BreakerCooldown, then probe.
 	BreakerThreshold int
+	BreakerWindow    time.Duration
 	BreakerCooldown  time.Duration
 
 	// QueueDepthInterval is how often the queue_depth gauge is refreshed.
@@ -118,6 +119,7 @@ func Load(lookup LookupFunc) (Config, error) {
 			RetryFactor:      r.float("RETRY_BACKOFF_FACTOR", 2),
 			RetryMaxDelay:    r.duration("RETRY_MAX_DELAY", 5*time.Minute),
 			BreakerThreshold: r.int("BREAKER_FAILURE_THRESHOLD", 5),
+			BreakerWindow:    r.duration("BREAKER_FAILURE_WINDOW", time.Minute),
 			BreakerCooldown:  r.duration("BREAKER_COOLDOWN", 30*time.Second),
 
 			QueueDepthInterval: r.duration("QUEUE_DEPTH_INTERVAL", 15*time.Second),
@@ -157,8 +159,8 @@ func Load(lookup LookupFunc) (Config, error) {
 	r.require(w.QueueDepthInterval > 0, "QUEUE_DEPTH_INTERVAL must be positive")
 	r.require(w.RetryFactor >= 1, "RETRY_BACKOFF_FACTOR must be >= 1")
 	r.require(w.RetryMaxDelay >= w.RetryBaseDelay, "RETRY_MAX_DELAY must be >= RETRY_BASE_DELAY")
-	r.require(w.BreakerThreshold >= 1 && w.BreakerCooldown > 0,
-		"BREAKER_FAILURE_THRESHOLD must be >= 1 and BREAKER_COOLDOWN positive")
+	r.require(w.BreakerThreshold >= 1 && w.BreakerCooldown > 0 && w.BreakerWindow > 0,
+		"BREAKER_FAILURE_THRESHOLD must be >= 1, BREAKER_FAILURE_WINDOW and BREAKER_COOLDOWN positive")
 	for ch, rate := range cfg.RateLimit.PerSecond {
 		r.require(rate > 0, "RATE_LIMIT_%s_PER_SECOND must be positive", strings.ToUpper(ch))
 	}

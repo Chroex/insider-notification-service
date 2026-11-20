@@ -55,6 +55,7 @@ type Config struct {
 
 	// Circuit breaker per channel (see Breaker).
 	BreakerThreshold int
+	BreakerWindow    time.Duration // failures further apart than this are not consecutive
 	BreakerCooldown  time.Duration
 
 	// Observer receives delivery events for metrics. Optional.
@@ -108,7 +109,7 @@ func New(q Queue, s Sender, limiter RateLimiter, cfg Config, log *slog.Logger) *
 	w := &Worker{queue: q, sender: s, limiter: limiter, cfg: cfg, log: log, now: time.Now,
 		breakers: make(map[domain.Channel]*Breaker, len(cfg.Channels))}
 	for _, ch := range cfg.Channels {
-		w.breakers[ch] = NewBreaker(cfg.BreakerThreshold, cfg.BreakerCooldown, func(from, to BreakerState) {
+		w.breakers[ch] = NewBreaker(cfg.BreakerThreshold, cfg.BreakerWindow, cfg.BreakerCooldown, func(from, to BreakerState) {
 			level := slog.LevelWarn
 			if to == BreakerClosed {
 				level = slog.LevelInfo
@@ -293,7 +294,7 @@ func (w *Worker) process(stopCtx, sendCtx context.Context, job domain.Notificati
 	c := Classify(sendErr)
 	w.cfg.Observer.AttemptFinished(job.Channel, c.Outcome, duration)
 	if sendCtx.Err() == nil { // a send aborted by our own shutdown says nothing about provider health
-		breaker.Record(c.Outcome)
+		breaker.Record(c.Outcome, job.ID.String())
 	}
 	decision := w.cfg.Policy.Decide(job.Attempts, job.MaxAttempts, c, w.now())
 	completion := buildCompletion(job, res, c, decision, start, duration)

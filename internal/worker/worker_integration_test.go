@@ -157,6 +157,7 @@ func testConfig() worker.Config {
 		}},
 		// High threshold: most tests exercise retries, not the breaker.
 		BreakerThreshold: 1000,
+		BreakerWindow:    time.Minute,
 		BreakerCooldown:  time.Second,
 	}
 }

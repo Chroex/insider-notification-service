@@ -95,6 +95,7 @@ func run() error {
 				Max:    cfg.Worker.RetryMaxDelay,
 			}},
 			BreakerThreshold: cfg.Worker.BreakerThreshold,
+			BreakerWindow:    cfg.Worker.BreakerWindow,
 			BreakerCooldown:  cfg.Worker.BreakerCooldown,
 			Observer:         metrics,
 		},

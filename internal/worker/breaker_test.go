@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -23,16 +24,20 @@ func (c *fakeClock) advance(d time.Duration) { c.t = c.t.Add(d) }
 func newTestBreaker(threshold int, cooldown time.Duration) (*Breaker, *fakeClock, *[]string) {
 	clock := &fakeClock{t: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
 	var transitions []string
-	b := NewBreaker(threshold, cooldown, func(from, to BreakerState) {
+	b := NewBreaker(threshold, time.Minute, cooldown, func(from, to BreakerState) {
 		transitions = append(transitions, from.String()+"->"+to.String())
 	})
 	b.now = clock.now
 	return b, clock, &transitions
 }
 
+// record feeds outcomes for distinct notifications n1, n2, ...
+var keySeq int
+
 func record(b *Breaker, outcomes ...domain.AttemptOutcome) {
 	for _, o := range outcomes {
-		b.Record(o)
+		keySeq++
+		b.Record(o, fmt.Sprintf("n%d", keySeq))
 	}
 }
 
@@ -85,7 +90,7 @@ func TestBreaker_FullCycle(t *testing.T) {
 		t.Fatalf("second caller during probe got %d permits, want 0", p)
 	}
 
-	b.Record(retryable) // probe fails -> open again, cooldown restarts
+	record(b, retryable) // probe fails -> open again, cooldown restarts
 	if p, wait := b.Permits(); p != 0 || wait != 30*time.Second {
 		t.Fatalf("failed probe: permits=%d wait=%v", p, wait)
 	}
@@ -94,7 +99,7 @@ func TestBreaker_FullCycle(t *testing.T) {
 	if p, _ := b.Permits(); p != 1 {
 		t.Fatal("expected a second probe")
 	}
-	b.Record(ok) // probe succeeds -> closed
+	record(b, ok) // probe succeeds -> closed
 	if p, _ := b.Permits(); p != breakerNoLimit || b.State() != BreakerClosed {
 		t.Fatalf("after good probe: permits=%d state=%s", p, b.State())
 	}
@@ -107,7 +112,7 @@ func TestBreaker_FullCycle(t *testing.T) {
 
 func TestBreaker_ReleaseProbeAllowsAnotherProbe(t *testing.T) {
 	b, clock, _ := newTestBreaker(1, time.Second)
-	b.Record(retryable)
+	record(b, retryable)
 	clock.advance(time.Second)
 	if p, _ := b.Permits(); p != 1 {
 		t.Fatal("expected probe permit")
@@ -120,7 +125,7 @@ func TestBreaker_ReleaseProbeAllowsAnotherProbe(t *testing.T) {
 
 func TestBreaker_IgnoresLateResultsWhileOpen(t *testing.T) {
 	b, _, transitions := newTestBreaker(1, time.Minute)
-	b.Record(retryable) // open
+	record(b, retryable) // open
 	record(b, ok, ok, retryable)
 	if b.State() != BreakerOpen || len(*transitions) != 1 {
 		t.Errorf("state = %s, transitions = %v; late results must not change an open breaker",
@@ -129,7 +134,7 @@ func TestBreaker_IgnoresLateResultsWhileOpen(t *testing.T) {
 }
 
 func TestBreaker_ConcurrentUse(t *testing.T) {
-	b := NewBreaker(5, time.Millisecond, nil)
+	b := NewBreaker(5, time.Second, time.Millisecond, nil)
 	var wg sync.WaitGroup
 	for i := range 8 {
 		wg.Add(1)
@@ -137,14 +142,48 @@ func TestBreaker_ConcurrentUse(t *testing.T) {
 			defer wg.Done()
 			for j := range 1000 {
 				b.Permits()
+				key := fmt.Sprintf("g%d-%d", i, j)
 				if (i+j)%3 == 0 {
-					b.Record(ok)
+					b.Record(ok, key)
 				} else {
-					b.Record(retryable)
+					b.Record(retryable, key)
 				}
 				b.ReleaseProbe()
 			}
 		}()
 	}
 	wg.Wait() // run with -race
+}
+
+// A single poison message (e.g. always 503) retried many times must not
+// open the breaker for the whole channel on its own.
+func TestBreaker_RetriesOfOneNotificationCountOnce(t *testing.T) {
+	b, _, _ := newTestBreaker(3, time.Minute)
+	for range 10 {
+		b.Record(retryable, "poison")
+	}
+	if b.State() != BreakerClosed {
+		t.Fatal("one notification's retries opened the breaker")
+	}
+	b.Record(retryable, "a")
+	b.Record(retryable, "b") // poison + a + b = 3 distinct
+	if b.State() != BreakerOpen {
+		t.Errorf("state = %s, want open after 3 distinct failing notifications", b.State())
+	}
+}
+
+// Failures separated by a quiet period are not consecutive.
+func TestBreaker_StaleFailuresExpire(t *testing.T) {
+	b, clock, _ := newTestBreaker(3, time.Minute) // window is 1 minute
+	record(b, retryable, retryable)
+	clock.advance(2 * time.Minute)
+	record(b, retryable, retryable)
+	if b.State() != BreakerClosed {
+		t.Fatal("failures from 2 minutes ago were counted with new ones")
+	}
+	clock.advance(30 * time.Second) // within the window of the last failure
+	record(b, retryable)
+	if b.State() != BreakerOpen {
+		t.Errorf("state = %s, want open (3 failures, each within 1m of the previous)", b.State())
+	}
 }
