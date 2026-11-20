@@ -11,6 +11,8 @@ import (
 	"syscall"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+
 	"notification-service/internal/config"
 	"notification-service/internal/health"
 	"notification-service/internal/mockprovider"
@@ -29,9 +31,22 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// The mock joins the worker's traces (incoming traceparent), so Jaeger
+	// shows the provider side of each attempt too.
+	shutdownTracing, err := observability.SetupTracing(ctx, "mockprovider")
+	if err != nil {
+		log.Error("tracing setup", "error", err)
+		os.Exit(1)
+	}
+	defer func() {
+		flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = shutdownTracing(flushCtx)
+	}()
+
 	mux := http.NewServeMux()
 	health.Register(mux, time.Second) // no dependencies to check
-	mux.Handle("/send", mockprovider.New(cfg, log))
+	mux.Handle("/send", otelhttp.NewHandler(mockprovider.New(cfg, log), "provider.send"))
 
 	srv := &http.Server{Addr: cfg.Addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	log.Info("mock provider config",

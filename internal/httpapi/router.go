@@ -57,7 +57,7 @@ func NewRouter(opts Options) http.Handler {
 	// "/" matches anything not matched above: JSON 404 instead of text/plain.
 	mux.HandleFunc("/", notFound)
 
-	return chain(mux, cors(opts.CORSAllowedOrigins), correlationID(opts.Logger), requestLogger, recoverer, httpMetrics(metrics))
+	return chain(mux, tracing, cors(opts.CORSAllowedOrigins), correlationID(opts.Logger), requestLogger, recoverer, httpMetrics(metrics))
 }
 
 const metricsPattern = "GET /metrics"

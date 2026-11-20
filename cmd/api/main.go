@@ -41,6 +41,14 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// Before any connection is created, so pgx/Redis instrumentation and
+	// the HTTP middleware pick up the real tracer provider.
+	shutdownTracing, err := observability.SetupTracing(ctx, "api")
+	if err != nil {
+		return err
+	}
+	defer flushTraces(shutdownTracing, log)
+
 	db, err := platform.NewPostgresPool(ctx, cfg.DatabaseURL, cfg.DBMaxConns)
 	if err != nil {
 		return err
@@ -85,4 +93,14 @@ func run() error {
 	}
 	log.Info("api stopped cleanly")
 	return nil
+}
+
+// flushTraces exports buffered spans before exit; bounded so a dead
+// collector can't hold up shutdown.
+func flushTraces(shutdown func(context.Context) error, log *slog.Logger) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := shutdown(ctx); err != nil {
+		log.Warn("flushing traces failed", "error", err)
+	}
 }

@@ -10,7 +10,9 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/exaring/otelpgx"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/extra/redisotel/v9"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -22,6 +24,9 @@ func NewPostgresPool(ctx context.Context, url string, maxConns int) (*pgxpool.Po
 		return nil, fmt.Errorf("parse DATABASE_URL: %w", err)
 	}
 	poolCfg.MaxConns = int32(maxConns) //nolint:gosec // validated positive and small in config
+	// A span per query, parented to the request or delivery that issued it
+	// (no-op unless tracing is enabled).
+	poolCfg.ConnConfig.Tracer = otelpgx.NewTracer()
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		return nil, fmt.Errorf("create postgres pool: %w", err)
@@ -42,6 +47,10 @@ func NewRedisClient(ctx context.Context, url string) (*redis.Client, error) {
 		return nil, fmt.Errorf("parse REDIS_URL: %w", err)
 	}
 	client := redis.NewClient(opts)
+	if err := redisotel.InstrumentTracing(client); err != nil {
+		_ = client.Close()
+		return nil, fmt.Errorf("instrument redis tracing: %w", err)
+	}
 	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if err := client.Ping(pingCtx).Err(); err != nil {

@@ -21,6 +21,9 @@ import (
 	"github.com/getkin/kin-openapi/openapi3filter"
 	"github.com/getkin/kin-openapi/routers"
 	legacyrouter "github.com/getkin/kin-openapi/routers/legacy"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 
 	"notification-service/internal/events"
 	"notification-service/internal/httpapi"
@@ -1018,5 +1021,32 @@ func TestStatusStream_DisabledWithoutHub(t *testing.T) {
 	// unavailable instead of hanging; the response is checked against the spec.
 	if r := call(t, "GET", "/ws", nil); r.Status != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want 503", r.Status)
+	}
+}
+
+// --- tracing ---
+
+// An incoming W3C traceparent is continued by the API and stored on the row,
+// so the worker can join the same trace later.
+func TestTracing_TraceParentStoredOnCreate(t *testing.T) {
+	db.Reset(t)
+	tp := sdktrace.NewTracerProvider()
+	prevTP, prevProp := otel.GetTracerProvider(), otel.GetTextMapPropagator()
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+	t.Cleanup(func() { otel.SetTracerProvider(prevTP); otel.SetTextMapPropagator(prevProp) })
+
+	const traceID = "4bf92f3577b34da6a3ce929d0e0e4736"
+	r := call(t, "POST", "/api/v1/notifications", sms("traced"),
+		"Traceparent", "00-"+traceID+"-00f067aa0ba902b7-01")
+	expectStatus(t, r, http.StatusCreated)
+
+	var stored *string
+	if err := db.Pool.QueryRow(context.Background(),
+		"SELECT trace_parent FROM notifications WHERE id = $1", r.Body["id"]).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored == nil || !strings.Contains(*stored, traceID) {
+		t.Errorf("stored trace_parent = %v, want trace %s", stored, traceID)
 	}
 }

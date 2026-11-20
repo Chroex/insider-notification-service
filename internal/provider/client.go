@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 // Message is what we ask the provider to deliver.
@@ -74,8 +75,10 @@ func NewClient(url string, timeout time.Duration) *Client {
 	// connections per host would force constant reconnects.
 	transport.MaxIdleConnsPerHost = 100
 	return &Client{
-		url:     url,
-		http:    &http.Client{Transport: transport},
+		url: url,
+		// otelhttp adds a client span per call and the W3C traceparent
+		// header, so a tracing-aware provider joins the same trace.
+		http:    &http.Client{Transport: otelhttp.NewTransport(transport)},
 		timeout: timeout,
 		now:     time.Now,
 	}

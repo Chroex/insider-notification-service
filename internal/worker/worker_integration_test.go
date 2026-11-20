@@ -21,6 +21,11 @@ import (
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
 	promtest "github.com/prometheus/client_golang/prometheus/testutil"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
 
 	"notification-service/internal/domain"
 	"notification-service/internal/events"
@@ -900,5 +905,55 @@ func TestStatusEvents_PublishedByWorker(t *testing.T) {
 	}
 	if len(rec.evs) > 1 && rec.evs[1].Error == "" {
 		t.Error("retrying event should carry the error")
+	}
+}
+
+// --- tracing ---
+
+// The delivery span must continue the trace stored on the row (one trace
+// from API request to provider), and the provider must receive it too.
+func TestTracing_DeliveryContinuesStoredTrace(t *testing.T) {
+	db.Reset(t)
+	recorder := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	prevTP, prevProp := otel.GetTracerProvider(), otel.GetTextMapPropagator()
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+	t.Cleanup(func() { otel.SetTracerProvider(prevTP); otel.SetTextMapPropagator(prevProp) })
+
+	// Simulate the API: a request span whose context is stored on the row.
+	apiCtx, apiSpan := tp.Tracer("api").Start(context.Background(), "POST /api/v1/notifications")
+	traceParent := observability.TraceParent(apiCtx)
+	apiSpan.End()
+
+	fp := newFakeProvider(t, always(http.StatusAccepted))
+	n := insertNotification(t, domain.ChannelSMS, func(x *domain.Notification) { x.TraceParent = traceParent })
+	startWorker(t, fp.URL, testConfig())
+	waitForStatus(t, n.ID, domain.StatusSent, 5*time.Second)
+	_ = tp.ForceFlush(context.Background())
+
+	var deliver sdktrace.ReadOnlySpan
+	for _, s := range recorder.Ended() {
+		if s.Name() == "deliver sms" {
+			deliver = s
+		}
+	}
+	if deliver == nil {
+		t.Fatal("no delivery span recorded")
+	}
+	want := apiSpan.SpanContext()
+	if deliver.SpanContext().TraceID() != want.TraceID() || deliver.Parent().SpanID() != want.SpanID() {
+		t.Errorf("delivery span trace/parent = %s/%s, want %s/%s",
+			deliver.SpanContext().TraceID(), deliver.Parent().SpanID(), want.TraceID(), want.SpanID())
+	}
+	if deliver.SpanKind() != trace.SpanKindConsumer {
+		t.Errorf("kind = %v, want consumer", deliver.SpanKind())
+	}
+
+	fp.mu.Lock()
+	providerTP := fp.headers[0].Get("Traceparent")
+	fp.mu.Unlock()
+	if !strings.Contains(providerTP, want.TraceID().String()) {
+		t.Errorf("provider received traceparent %q, want trace %s", providerTP, want.TraceID())
 	}
 }

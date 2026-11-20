@@ -5,6 +5,8 @@ x-app-env: &app-env
   DATABASE_URL: postgres://notifications:notifications@postgres:5432/notifications?sslmode=disable
   REDIS_URL: redis://redis:6379/0
   PROVIDER_URL: ${PROVIDER_URL:-http://mockprovider:8090/send}
+  # Tracing is on when this is set (unset it to disable). Jaeger UI: :16686
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT-http://jaeger:4318}
 
 x-app-depends: &app-depends
   postgres:
@@ -74,12 +76,19 @@ services:
     build: { context: ., target: mockprovider }
     environment:
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT-http://jaeger:4318}
       MOCK_ADDR: :8090
       MOCK_FAILURE_RATE: ${MOCK_FAILURE_RATE:-0.1}
       MOCK_FAILURE_CODES: ${MOCK_FAILURE_CODES:-500,503,429}
       MOCK_LATENCY_MIN: ${MOCK_LATENCY_MIN:-20ms}
       MOCK_LATENCY_MAX: ${MOCK_LATENCY_MAX:-120ms}
     ports: ["8090:8090"]
+
+  # Distributed tracing backend (OTLP in, UI on :16686). In-memory storage:
+  # traces are lost on restart, which is fine for local use.
+  jaeger:
+    image: jaegertracing/jaeger:2.11.0
+    ports: ["16686:16686"]
 
   swagger-ui:
     image: swaggerapi/swagger-ui:v5.33.3

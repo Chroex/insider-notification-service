@@ -7,6 +7,10 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+
 	"notification-service/internal/domain"
 	"notification-service/internal/events"
 	"notification-service/internal/observability"
@@ -287,6 +291,16 @@ func (w *Worker) process(stopCtx, sendCtx context.Context, job domain.Notificati
 		return
 	}
 
+	// One span per attempt, continuing the trace of the request that created
+	// the notification (traceparent stored on the row), so a single trace
+	// shows API -> DB -> queue wait -> each attempt -> provider. Everything
+	// below (DB writes, Redis publish, provider call) is parented to it.
+	sendCtx, span := w.startAttemptSpan(sendCtx, job)
+	defer span.End()
+	if sc := span.SpanContext(); sc.IsValid() {
+		log = log.With(observability.KeyTraceID, sc.TraceID().String())
+	}
+
 	w.cfg.Events.Publish(sendCtx, events.FromNotification(job, w.now())) // status: processing
 
 	start := w.now()
@@ -306,6 +320,7 @@ func (w *Worker) process(stopCtx, sendCtx context.Context, job domain.Notificati
 	}
 	decision := w.cfg.Policy.Decide(job.Attempts, job.MaxAttempts, c, w.now())
 	completion := buildCompletion(job, res, c, decision, start, duration)
+	recordAttemptOnSpan(span, c, decision)
 
 	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(sendCtx), persistTimeout)
 	defer cancel()
@@ -324,6 +339,35 @@ func (w *Worker) process(stopCtx, sendCtx context.Context, job domain.Notificati
 	w.observeDecision(job, decision)
 	w.publishDecision(sendCtx, job, decision)
 	logDecision(log, decision, c, duration)
+}
+
+func (w *Worker) startAttemptSpan(ctx context.Context, job domain.Notification) (context.Context, trace.Span) {
+	ctx = observability.ContextWithTraceParent(ctx, job.TraceParent)
+	attrs := []attribute.KeyValue{
+		attribute.String("notification.id", job.ID.String()),
+		attribute.String("notification.channel", string(job.Channel)),
+		attribute.String("notification.priority", string(job.Priority)),
+		attribute.Int("notification.attempt", job.Attempts),
+		attribute.String("correlation_id", job.CorrelationID),
+	}
+	if job.BatchID != nil {
+		attrs = append(attrs, attribute.String("notification.batch_id", job.BatchID.String()))
+	}
+	return observability.Tracer().Start(ctx, "deliver "+string(job.Channel),
+		trace.WithSpanKind(trace.SpanKindConsumer), trace.WithAttributes(attrs...))
+}
+
+func recordAttemptOnSpan(span trace.Span, c Classification, d Decision) {
+	span.SetAttributes(
+		attribute.String("delivery.outcome", string(c.Outcome)),
+		attribute.String("notification.status", string(d.Status)),
+	)
+	if c.HTTPStatus != nil {
+		span.SetAttributes(attribute.Int("http.response.status_code", *c.HTTPStatus))
+	}
+	if c.Outcome != domain.OutcomeSuccess {
+		span.SetStatus(codes.Error, c.Err)
+	}
 }
 
 // publishDecision streams the committed status change to live clients.

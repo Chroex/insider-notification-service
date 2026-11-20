@@ -12,6 +12,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"notification-service/internal/observability"
 )
@@ -36,7 +39,13 @@ func correlationID(base *slog.Logger) func(http.Handler) http.Handler {
 			w.Header().Set(HeaderCorrelationID, id)
 
 			ctx := observability.WithCorrelationID(r.Context(), id)
-			ctx = observability.WithLogger(ctx, base.With(observability.KeyCorrelationID, id))
+			log := base.With(observability.KeyCorrelationID, id)
+			if sc := trace.SpanContextFromContext(ctx); sc.IsValid() {
+				// trace_id in every log line lets you jump from a log to its trace.
+				log = log.With(observability.KeyTraceID, sc.TraceID().String())
+				trace.SpanFromContext(ctx).SetAttributes(attribute.String("correlation_id", id))
+			}
+			ctx = observability.WithLogger(ctx, log)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
@@ -108,6 +117,16 @@ func recoverer(next http.Handler) http.Handler {
 	})
 }
 
+// tracing starts a server span per request (continuing an incoming
+// traceparent). Probes, metrics scrapes and long-lived WebSockets are not
+// traced: they would be noise, or a span that lasts hours.
+func tracing(next http.Handler) http.Handler {
+	return otelhttp.NewHandler(next, "http.request",
+		otelhttp.WithFilter(func(r *http.Request) bool {
+			return !strings.HasPrefix(r.URL.Path, "/health/") && r.URL.Path != "/metrics" && r.URL.Path != "/ws"
+		}))
+}
+
 // httpMetrics records request count and latency per route pattern.
 //
 // It must be the innermost middleware: ServeMux stores the matched pattern
@@ -125,6 +144,9 @@ func httpMetrics(m *observability.APIMetrics) func(http.Handler) http.Handler {
 				route = "unmatched"
 			}
 			m.ObserveHTTP(r.Method, route, rec.status, time.Since(start))
+			// Name the span after the route pattern now that the mux has
+			// matched it ("POST /api/v1/notifications", not a raw path).
+			trace.SpanFromContext(r.Context()).SetName(route)
 		})
 	}
 }
