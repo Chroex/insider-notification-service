@@ -22,12 +22,16 @@ import (
 	"notification-service/internal/domain"
 	"notification-service/internal/provider"
 	"notification-service/internal/queue"
+	"notification-service/internal/ratelimit"
 	"notification-service/internal/store"
 	"notification-service/internal/testutil"
 	"notification-service/internal/worker"
 )
 
-var db *testutil.Postgres
+var (
+	db  *testutil.Postgres
+	rdb *testutil.Redis
+)
 
 func TestMain(m *testing.M) {
 	ctx := context.Background()
@@ -36,7 +40,13 @@ func TestMain(m *testing.M) {
 		fmt.Fprintln(os.Stderr, "integration setup:", err)
 		os.Exit(1)
 	}
+	if rdb, err = testutil.StartRedis(ctx); err != nil {
+		db.Close(ctx)
+		fmt.Fprintln(os.Stderr, "integration setup:", err)
+		os.Exit(1)
+	}
 	code := m.Run()
+	rdb.Close(ctx)
 	db.Close(ctx)
 	os.Exit(code)
 }
@@ -95,6 +105,17 @@ func (fp *fakeProvider) callsFor(id uuid.UUID) int {
 	return fp.calls[id.String()]
 }
 
+// order returns notification ids in the order requests arrived.
+func (fp *fakeProvider) order() []string {
+	fp.mu.Lock()
+	defer fp.mu.Unlock()
+	ids := make([]string, len(fp.headers))
+	for i, h := range fp.headers {
+		ids[i] = h.Get("X-Notification-ID")
+	}
+	return ids
+}
+
 func (fp *fakeProvider) totalCalls() int {
 	fp.mu.Lock()
 	defer fp.mu.Unlock()
@@ -124,11 +145,16 @@ func testConfig() worker.Config {
 	}
 }
 
-// startWorker runs a worker until the test ends (or stop is called) and
-// returns a stop function that blocks until Run has returned.
+// startWorker runs an unlimited worker until the test ends (or stop is
+// called) and returns a stop function that blocks until Run has returned.
 func startWorker(t *testing.T, providerURL string, cfg worker.Config) (stop func()) {
 	t.Helper()
-	w := worker.New(queue.New(db.Pool), provider.NewClient(providerURL, 2*time.Second), worker.Unlimited{}, cfg,
+	return startWorkerWithLimiter(t, providerURL, cfg, worker.Unlimited{})
+}
+
+func startWorkerWithLimiter(t *testing.T, providerURL string, cfg worker.Config, limiter worker.RateLimiter) (stop func()) {
+	t.Helper()
+	w := worker.New(queue.New(db.Pool), provider.NewClient(providerURL, 2*time.Second), limiter, cfg,
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -148,6 +174,10 @@ func startWorker(t *testing.T, providerURL string, cfg worker.Config) (stop func
 }
 
 type notificationOpt func(*domain.Notification)
+
+func withPriority(p domain.Priority) notificationOpt {
+	return func(x *domain.Notification) { x.Priority = p }
+}
 
 func withMaxAttempts(n int) notificationOpt {
 	return func(x *domain.Notification) { x.MaxAttempts = n }
@@ -538,5 +568,87 @@ func TestQueue_ClaimIsPerChannel(t *testing.T) {
 	jobs, err := queue.New(db.Pool).Claim(ctx, domain.ChannelPush, 10, time.Minute)
 	if err != nil || len(jobs) != 0 {
 		t.Errorf("push claim returned %d sms jobs (err %v)", len(jobs), err)
+	}
+}
+
+// --- rate limiting ---
+
+// Two worker replicas share one Redis bucket, so together they must stay
+// near rate*window + burst, not 2x that.
+func TestRateLimit_CapsChannelThroughputAcrossWorkers(t *testing.T) {
+	db.Reset(t)
+	fp := newFakeProvider(t, always(http.StatusAccepted))
+	for range 500 {
+		insertNotification(t, domain.ChannelSMS)
+	}
+
+	const rate, burst = 100.0, 10
+	limits := map[domain.Channel]ratelimit.Limit{}
+	for _, ch := range domain.Channels {
+		limits[ch] = ratelimit.Limit{PerSecond: rate, Burst: burst}
+	}
+	prefix := "test-" + uuid.NewString() + ":"
+	cfg := testConfig()
+	cfg.Concurrency, cfg.ClaimBatchSize = 20, 10
+
+	stopA := startWorkerWithLimiter(t, fp.URL, cfg, ratelimit.New(rdb.Client, limits, prefix))
+	stopB := startWorkerWithLimiter(t, fp.URL, cfg, ratelimit.New(rdb.Client, limits, prefix))
+	const window = 2 * time.Second
+	time.Sleep(window)
+	stopA()
+	stopB()
+
+	want := float64(burst) + rate*window.Seconds() // ~210
+	got := float64(fp.totalCalls())
+	if got < want*0.8 || got > want*1.15 {
+		t.Errorf("provider received %.0f sms in %v with 2 workers, want ~%.0f", got, window, want)
+	}
+	t.Logf("2 workers sent %.0f sms in %v (cap ~%.0f)", got, window, want)
+}
+
+// --- priority ---
+
+func TestPriority_ClaimOrderIsStrict(t *testing.T) {
+	db.Reset(t)
+	ctx := context.Background()
+	q := queue.New(db.Pool)
+	// Insert in the "wrong" order: the low ones are the oldest.
+	want := map[domain.Priority]map[uuid.UUID]bool{}
+	for _, p := range []domain.Priority{domain.PriorityLow, domain.PriorityNormal, domain.PriorityHigh} {
+		want[p] = map[uuid.UUID]bool{}
+		for range 3 {
+			want[p][insertNotification(t, domain.ChannelSMS, withPriority(p)).ID] = true
+		}
+	}
+
+	for _, p := range []domain.Priority{domain.PriorityHigh, domain.PriorityNormal, domain.PriorityLow} {
+		jobs, err := q.Claim(ctx, domain.ChannelSMS, 3, time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, j := range jobs {
+			if !want[p][j.ID] {
+				t.Errorf("claim for %s returned a %s notification", p, j.Priority)
+			}
+		}
+	}
+}
+
+func TestPriority_HighIsSentBeforeOlderLow(t *testing.T) {
+	db.Reset(t)
+	fp := newFakeProvider(t, always(http.StatusAccepted))
+	low := insertNotification(t, domain.ChannelSMS, withPriority(domain.PriorityLow))
+	normal := insertNotification(t, domain.ChannelSMS)
+	high := insertNotification(t, domain.ChannelSMS, withPriority(domain.PriorityHigh))
+
+	cfg := testConfig()
+	cfg.Concurrency, cfg.ClaimBatchSize = 1, 1 // one at a time, so order is observable
+	startWorker(t, fp.URL, cfg)
+	waitForStatus(t, low.ID, domain.StatusSent, 5*time.Second)
+
+	got := strings.Join(fp.order(), ",")
+	want := strings.Join([]string{high.ID.String(), normal.ID.String(), low.ID.String()}, ",")
+	if got != want {
+		t.Errorf("send order = %s\nwant         %s (high, normal, low)", got, want)
 	}
 }
