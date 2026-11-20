@@ -682,3 +682,73 @@ Anything not `failed` gets 409, the same conditional-UPDATE pattern as cancel.
 
 **Future work.** A bulk redrive (`POST /notifications/retry?batch_id=...` or by
 error type) for after a provider outage or a fixed configuration bug.
+
+---
+
+## ADR-026: Observability: metrics, summary and correlation
+
+**Metrics (Prometheus, `GET /metrics` on the API and the worker admin port).**
+
+| Metric | Type | Labels | Source |
+|---|---|---|---|
+| `notifications_created_total` | counter | channel, priority | API (replays not counted) |
+| `http_requests_total`, `http_request_duration_seconds` | counter, histogram | method, route, status | API |
+| `notifications_sent_total` | counter | channel | worker |
+| `notifications_failed_total` | counter | channel, reason (`permanent_error`, `max_attempts`, `lease_expired`) | worker |
+| `delivery_attempts_total` | counter | channel, outcome | worker |
+| `delivery_latency_seconds` | histogram | channel | worker (one provider call) |
+| `end_to_end_latency_seconds` | histogram | channel | worker (due → sent) |
+| `queue_depth` | gauge | channel, priority, status | worker, refreshed from Postgres |
+| `circuit_breaker_state` | gauge (0/1/2) | channel | worker |
+| `leases_reaped_total` | counter | result | worker |
+
+Design choices:
+- **One registry per binary** (not the global default), each exporting only
+  what that process produces, plus Go runtime and process collectors.
+- **Bounded label cardinality.** HTTP metrics are labelled with the mux
+  *pattern* (`GET /api/v1/notifications/{id}`), never the raw path, which
+  contains ids and would create one time series per notification (tested).
+  The metrics middleware is innermost because `ServeMux` writes `r.Pattern`
+  into the request it receives, and outer middleware pass it a copy.
+- **The engine reports through a small `worker.Observer` interface** defined
+  next to the code that uses it, so the worker has no Prometheus dependency and
+  tests can plug in fakes.
+- **End-to-end latency is measured from when the notification became due**
+  (`scheduled_at` if later than `created_at`), so a send scheduled for tomorrow
+  doesn't look like a day of latency.
+- **`queue_depth` comes from Postgres** (`GROUP BY channel, priority, status`
+  over non-terminal rows, every 15s), because the database is the only place
+  that knows the true backlog. Every replica exports the same value, so
+  dashboards aggregate with `max`, not `sum`. Every combination is written
+  (zero-filled), so a drained series reads 0 instead of keeping its last
+  value (tested).
+- Series that alerts depend on (`notifications_sent_total`,
+  `circuit_breaker_state`) are pre-created at 0, so "no data" never hides a
+  stuck worker.
+
+**`GET /api/v1/metrics/summary?window=1h`** is for humans without Prometheus:
+current queue depth, plus sent/failed counts, success rates, attempt outcomes
+and p50/p95 provider and end-to-end latency over the window, overall and per
+channel. It is computed **from Postgres, not from in-process histograms**:
+- it covers every worker replica, while a process's histograms only see that
+  process;
+- `percentile_cont` gives exact percentiles over the window, where Prometheus
+  histogram quantiles are bucket interpolations;
+- the window is arbitrary (1m-168h) without pre-aggregation.
+
+`GROUP BY ROLLUP (channel)` produces per-channel and overall percentiles in one
+query. Migration 000006 adds time-column indexes so the cost is proportional to
+the window, not the full history. Rates with no data are `null`, not 0% or
+100%.
+
+**Correlation.** The `X-Correlation-ID` header (validated, or generated) goes
+into the request context and every API log line, is stored on the row, and is
+attached to every worker log line and every provider request. Verified live:
+one batch with `trace-demo-42` → 1 API log line, 363 worker lines and 363
+provider requests (one per attempt), all carrying the id. Log keys are fixed
+constants: `correlation_id`, `notification_id`, `batch_id`, `channel`,
+`attempt`.
+
+**Measured live** (300 notifications, 20% injected failures): the worker's
+Prometheus counters and the DB-backed summary agree exactly (300 successes +
+63 retryable failures = 363 attempts).

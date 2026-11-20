@@ -57,6 +57,27 @@ Configuration is environment-only; see [.env.example](.env.example).
 
 See [docs/DECISIONS.md](docs/DECISIONS.md) ADR-019, ADR-023 to ADR-025 for the reasoning.
 
+## Observability
+
+- **Prometheus:** `GET /metrics` on the API (`:8080`) and the worker admin port
+  (`:8082`). Includes `notifications_created_total`, `notifications_sent_total`,
+  `notifications_failed_total{reason}`, `delivery_attempts_total{outcome}`,
+  `delivery_latency_seconds`, `end_to_end_latency_seconds`,
+  `queue_depth{channel,priority,status}` and `circuit_breaker_state`.
+- **Summary for humans:** `GET /api/v1/metrics/summary?window=15m` returns queue
+  depth, success rates and p50/p95 latencies, overall and per channel, computed
+  from Postgres (covers all worker replicas).
+- **Correlation:** send `X-Correlation-ID` (or one is generated). It appears in
+  every API and worker log line, on the notification row, and in the
+  provider request.
+- **Health:** `/health/live` (process up) and `/health/ready` (Postgres and Redis
+  reachable) on both the API and the worker.
+
+```bash
+curl -s localhost:8082/metrics | grep -E '^(notifications_sent_total|queue_depth)'
+curl -s 'localhost:8080/api/v1/metrics/summary?window=15m' | jq .overall
+```
+
 ## Assumptions (so far)
 
 Validation limits are configurable through environment variables:
