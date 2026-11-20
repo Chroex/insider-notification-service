@@ -70,12 +70,12 @@ func (s *Store) InsertNotification(ctx context.Context, n domain.Notification) (
 		INSERT INTO notifications (id, idempotency_key, request_hash, correlation_id, trace_parent,
 			channel, priority, recipient, content, template_id, variables, status, max_attempts,
 			next_attempt_at, scheduled_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, COALESCE($14, now()), $15)
 		ON CONFLICT (idempotency_key) DO NOTHING
 		RETURNING `+NotificationColumns,
 		n.ID, n.IdempotencyKey, n.RequestHash, n.CorrelationID, n.TraceParent,
 		n.Channel, n.Priority, n.Recipient, n.Content, n.TemplateID, n.Variables, n.Status, n.MaxAttempts,
-		n.NextAttemptAt, n.ScheduledAt,
+		scheduledDueAt(n), n.ScheduledAt,
 	)
 	created, err := ScanNotification(row)
 	if err == nil {
@@ -253,4 +253,21 @@ func (s *Store) RetryNotification(ctx context.Context, id uuid.UUID, extraAttemp
 		return domain.Notification{}, err
 	}
 	return domain.Notification{}, &domain.InvalidTransitionError{From: current.Status, Action: "retry"}
+}
+
+// scheduledDueAt returns the due time for a scheduled notification, or nil
+// for an immediate one so the database sets next_attempt_at = now().
+//
+// Postgres is the only clock that decides when a row is due: the claim query
+// compares next_attempt_at with the database's now(). If the API's clock
+// were used for immediate rows, an API host running a few milliseconds (or,
+// with broken NTP, minutes) ahead would make fresh notifications wait for
+// the skew. (Found as a flaky priority test: rows inserted with the test
+// process's clock were occasionally not yet due by the database's clock.)
+func scheduledDueAt(n domain.Notification) *time.Time {
+	if n.ScheduledAt == nil {
+		return nil
+	}
+	at := *n.ScheduledAt
+	return &at
 }

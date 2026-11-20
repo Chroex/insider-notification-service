@@ -456,12 +456,12 @@ func buildCompletion(job domain.Notification, res provider.Result, c Classificat
 	}
 
 	completion := queue.Completion{
-		ID:            job.ID,
-		AttemptNo:     job.Attempts,
-		Status:        d.Status,
-		NextAttemptAt: d.NextAttemptAt,
-		LastError:     d.LastError,
-		Attempt:       attempt,
+		ID:         job.ID,
+		AttemptNo:  job.Attempts,
+		Status:     d.Status,
+		RetryDelay: d.RetryDelay,
+		LastError:  d.LastError,
+		Attempt:    attempt,
 	}
 	if res.MessageID != "" {
 		id := res.MessageID

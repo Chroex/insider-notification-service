@@ -119,6 +119,23 @@ sends, and another write per row.
 `scheduled → processing` and `retrying → processing` happen directly when due;
 semantically they pass through "pending" for zero time.
 
+**Revision: one clock decides due-ness.** The claim query compares
+`next_attempt_at` with the *database's* `now()`, so every due time is now
+computed on that same clock:
+- immediate notifications get `now()` from the database (`COALESCE($n,
+  now())`, or the transaction's `now()` for a batch written with COPY);
+- retries store `now() + delay` in SQL, with the delay computed by the worker;
+- only `scheduled_at`, an absolute time the client asked for, comes from
+  outside.
+
+Before this, the API's and worker's clocks were used. A flaky priority test
+exposed it: rows written with the test process's clock were occasionally "not
+yet due" by the database's clock, most likely because of Docker Desktop VM
+clock drift. In production, API hosts with clock skew (or broken NTP) would
+delay notifications by the skew. A regression test simulates an app clock
+one hour fast, and fails without the fix. The same principle is why the rate
+limiter uses Redis's clock (ADR-021).
+
 ---
 
 ## ADR-003: Text columns with CHECK constraints, plus a generated `priority_rank`

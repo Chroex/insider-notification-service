@@ -55,8 +55,12 @@ func (b Backoff) Delay(attempt int) time.Duration {
 
 // Decision is the state a notification moves to after an attempt.
 type Decision struct {
-	Status        domain.Status
-	NextAttemptAt *time.Time // set only for StatusRetrying
+	Status domain.Status
+	// RetryDelay is how long to wait before the next attempt (StatusRetrying
+	// only). It is stored as now() + delay on the database clock.
+	RetryDelay *time.Duration
+	// NextAttemptAt is the same moment by the worker's clock, for logs.
+	NextAttemptAt *time.Time
 	LastError     *string
 	FailReason    string // "permanent_error" or "max_attempts" when failed
 }
@@ -82,9 +86,10 @@ func (p RetryPolicy) Decide(attempt, maxAttempts int, c Classification, now time
 			msg := fmt.Sprintf("giving up after %d attempts: %s", attempt, c.Err)
 			return Decision{Status: domain.StatusFailed, LastError: &msg, FailReason: "max_attempts"}
 		}
-		next := now.Add(p.delay(attempt, c))
+		delay := p.delay(attempt, c)
+		next := now.Add(delay)
 		msg := c.Err
-		return Decision{Status: domain.StatusRetrying, NextAttemptAt: &next, LastError: &msg}
+		return Decision{Status: domain.StatusRetrying, RetryDelay: &delay, NextAttemptAt: &next, LastError: &msg}
 	}
 }
 

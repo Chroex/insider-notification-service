@@ -95,10 +95,12 @@ func (q *Queue) Claim(ctx context.Context, channel domain.Channel, limit int, le
 
 // Completion is the result of one attempt, ready to persist.
 type Completion struct {
-	ID                uuid.UUID
-	AttemptNo         int // the attempts value our claim produced (fencing token)
-	Status            domain.Status
-	NextAttemptAt     *time.Time
+	ID        uuid.UUID
+	AttemptNo int // the attempts value our claim produced (fencing token)
+	Status    domain.Status
+	// RetryDelay, for StatusRetrying, becomes next_attempt_at = now() +
+	// delay on the database clock (the clock the claim query compares with).
+	RetryDelay        *time.Duration
 	LastError         *string
 	ProviderMessageID *string
 	Attempt           domain.DeliveryAttempt
@@ -132,12 +134,12 @@ func (q *Queue) Complete(ctx context.Context, c Completion) error {
 		UPDATE notifications
 		SET status              = $3,
 		    locked_until        = NULL,
-		    next_attempt_at     = COALESCE($4, next_attempt_at),
+		    next_attempt_at     = COALESCE(now() + $4::bigint * interval '1 millisecond', next_attempt_at),
 		    last_error          = $5,
 		    provider_message_id = COALESCE($6, provider_message_id),
 		    sent_at             = CASE WHEN $3 = 'sent' THEN now() ELSE sent_at END
 		WHERE id = $1 AND status = 'processing' AND attempts = $2`,
-		c.ID, c.AttemptNo, c.Status, c.NextAttemptAt, c.LastError, c.ProviderMessageID)
+		c.ID, c.AttemptNo, c.Status, delayMillis(c.RetryDelay), c.LastError, c.ProviderMessageID)
 	if err != nil {
 		return fmt.Errorf("complete: update: %w", err)
 	}
@@ -233,4 +235,12 @@ func qualified(alias, columns string) string {
 		parts[i] = alias + "." + strings.TrimSpace(col)
 	}
 	return strings.Join(parts, ", ")
+}
+
+func delayMillis(d *time.Duration) *int64 {
+	if d == nil {
+		return nil
+	}
+	ms := d.Milliseconds()
+	return &ms
 }

@@ -957,3 +957,45 @@ func TestTracing_DeliveryContinuesStoredTrace(t *testing.T) {
 		t.Errorf("provider received traceparent %q, want trace %s", providerTP, want.TraceID())
 	}
 }
+
+// --- clocks ---
+
+// Due-ness is decided by the database clock only. An API or worker host
+// whose clock runs ahead must not delay notifications.
+func TestQueue_DueTimesUseTheDatabaseClock(t *testing.T) {
+	db.Reset(t)
+	ctx := context.Background()
+	q := queue.New(db.Pool)
+
+	// An "API host" one hour ahead: the immediate notification is still due now.
+	n := insertNotification(t, domain.ChannelSMS, func(x *domain.Notification) {
+		x.NextAttemptAt = time.Now().Add(time.Hour)
+	})
+	jobs, err := q.Claim(ctx, domain.ChannelSMS, 1, time.Minute)
+	if err != nil || len(jobs) != 1 || jobs[0].ID != n.ID {
+		t.Fatalf("immediate notification not claimable with a fast app clock: %v, %v", jobs, err)
+	}
+
+	// A retry with zero delay is due immediately by the database clock.
+	if err := q.Complete(ctx, queue.Completion{
+		ID: n.ID, AttemptNo: jobs[0].Attempts, Status: domain.StatusRetrying, RetryDelay: new(time.Duration),
+		Attempt: domain.DeliveryAttempt{StartedAt: time.Now(), Outcome: domain.OutcomeRetryableError},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if jobs, err := q.Claim(ctx, domain.ChannelSMS, 1, time.Minute); err != nil || len(jobs) != 1 {
+		t.Fatalf("zero-delay retry not claimable: %v, %v", jobs, err)
+	}
+
+	// A batch row likewise (COPY path).
+	b := domain.Batch{ID: uuid.Must(uuid.NewV7()), Total: 1}
+	row := domain.Notification{ID: uuid.Must(uuid.NewV7()), CorrelationID: "c", Channel: domain.ChannelPush,
+		Priority: domain.PriorityNormal, Recipient: "tok", Content: "x", Status: domain.StatusPending,
+		MaxAttempts: 5, NextAttemptAt: time.Now().Add(time.Hour)}
+	if _, _, err := store.New(db.Pool).InsertBatch(ctx, b, []domain.Notification{row}); err != nil {
+		t.Fatal(err)
+	}
+	if jobs, err := q.Claim(ctx, domain.ChannelPush, 1, time.Minute); err != nil || len(jobs) != 1 {
+		t.Fatalf("batch row not claimable with a fast app clock: %v, %v", jobs, err)
+	}
+}

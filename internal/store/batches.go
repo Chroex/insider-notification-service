@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 
+	"time"
+
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
@@ -56,14 +58,25 @@ func (s *Store) InsertBatch(ctx context.Context, b domain.Batch, items []domain.
 		return domain.Batch{}, false, fmt.Errorf("insert batch: %w", err)
 	}
 
+	// COPY can't use column defaults per row, so immediate rows get the
+	// transaction's now() explicitly: the same database clock the claim
+	// query uses (see scheduledDueAt).
+	var dbNow time.Time
+	if err := tx.QueryRow(ctx, `SELECT now()`).Scan(&dbNow); err != nil {
+		return domain.Batch{}, false, fmt.Errorf("read database time: %w", err)
+	}
 	columns := []string{"id", "batch_id", "correlation_id", "trace_parent", "channel", "priority",
 		"recipient", "content", "template_id", "variables", "status", "max_attempts",
 		"next_attempt_at", "scheduled_at"}
 	rows := make([][]any, len(items))
 	for i, n := range items {
+		due := dbNow
+		if at := scheduledDueAt(n); at != nil {
+			due = *at
+		}
 		rows[i] = []any{n.ID, created.ID, n.CorrelationID, n.TraceParent, n.Channel, n.Priority,
 			n.Recipient, n.Content, n.TemplateID, n.Variables, n.Status, n.MaxAttempts,
-			n.NextAttemptAt, n.ScheduledAt}
+			due, n.ScheduledAt}
 	}
 	if _, err := tx.CopyFrom(ctx, pgx.Identifier{"notifications"}, columns, pgx.CopyFromRows(rows)); err != nil {
 		return domain.Batch{}, false, fmt.Errorf("copy batch notifications: %w", err)
