@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"notification-service/internal/domain"
+	"notification-service/internal/observability"
 	"notification-service/internal/store"
 	"notification-service/internal/validation"
 )
@@ -88,6 +89,7 @@ func (s *Service) Create(ctx context.Context, in CreateInput, idempotencyKey, co
 	}
 
 	n = s.build(in, correlationID)
+	n.TraceParent = observability.TraceParent(ctx)
 	if key != nil {
 		hash := requestHash("notification", canonicalize(in))
 		n.IdempotencyKey, n.RequestHash = key, &hash
@@ -153,9 +155,11 @@ func (s *Service) CreateBatch(ctx context.Context, items []CreateInput, idempote
 	batch := domain.Batch{ID: s.newID(), Total: len(items)}
 	rows := make([]domain.Notification, len(items))
 	ids := make([]uuid.UUID, len(items))
+	traceParent := observability.TraceParent(ctx)
 	for i, in := range items {
 		rows[i] = s.build(in, correlationID)
 		rows[i].BatchID = &batch.ID
+		rows[i].TraceParent = traceParent
 		ids[i] = rows[i].ID
 	}
 	if key != nil {

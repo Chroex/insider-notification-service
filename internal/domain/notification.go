@@ -13,6 +13,7 @@ type Notification struct {
 	IdempotencyKey    *string
 	RequestHash       *string
 	CorrelationID     string
+	TraceParent       *string // W3C traceparent of the creating request (tracing)
 	Channel           Channel
 	Priority          Priority
 	Recipient         string

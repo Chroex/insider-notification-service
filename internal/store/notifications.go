@@ -29,7 +29,7 @@ func New(pool *pgxpool.Pool) *Store {
 
 // NotificationColumns and ScanNotification are exported so the queue
 // package reads rows with exactly the same column order.
-const NotificationColumns = `id, batch_id, idempotency_key, request_hash, correlation_id,
+const NotificationColumns = `id, batch_id, idempotency_key, request_hash, correlation_id, trace_parent,
 	channel, priority, recipient, content, template_id, variables, status, attempts, max_attempts,
 	next_attempt_at, scheduled_at, locked_until, last_error, provider_message_id,
 	created_at, updated_at, sent_at`
@@ -37,7 +37,7 @@ const NotificationColumns = `id, batch_id, idempotency_key, request_hash, correl
 func ScanNotification(row pgx.Row) (domain.Notification, error) {
 	var n domain.Notification
 	err := row.Scan(
-		&n.ID, &n.BatchID, &n.IdempotencyKey, &n.RequestHash, &n.CorrelationID,
+		&n.ID, &n.BatchID, &n.IdempotencyKey, &n.RequestHash, &n.CorrelationID, &n.TraceParent,
 		&n.Channel, &n.Priority, &n.Recipient, &n.Content, &n.TemplateID, &n.Variables, &n.Status, &n.Attempts, &n.MaxAttempts,
 		&n.NextAttemptAt, &n.ScheduledAt, &n.LockedUntil, &n.LastError, &n.ProviderMessageID,
 		&n.CreatedAt, &n.UpdatedAt, &n.SentAt,
@@ -67,13 +67,13 @@ func collectNotifications(rows pgx.Rows) ([]domain.Notification, error) {
 // insert: the unique index arbitrates, and the loser reads the winner's row.
 func (s *Store) InsertNotification(ctx context.Context, n domain.Notification) (domain.Notification, bool, error) {
 	row := s.pool.QueryRow(ctx, `
-		INSERT INTO notifications (id, idempotency_key, request_hash, correlation_id,
+		INSERT INTO notifications (id, idempotency_key, request_hash, correlation_id, trace_parent,
 			channel, priority, recipient, content, template_id, variables, status, max_attempts,
 			next_attempt_at, scheduled_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 		ON CONFLICT (idempotency_key) DO NOTHING
 		RETURNING `+NotificationColumns,
-		n.ID, n.IdempotencyKey, n.RequestHash, n.CorrelationID,
+		n.ID, n.IdempotencyKey, n.RequestHash, n.CorrelationID, n.TraceParent,
 		n.Channel, n.Priority, n.Recipient, n.Content, n.TemplateID, n.Variables, n.Status, n.MaxAttempts,
 		n.NextAttemptAt, n.ScheduledAt,
 	)

@@ -56,12 +56,12 @@ func (s *Store) InsertBatch(ctx context.Context, b domain.Batch, items []domain.
 		return domain.Batch{}, false, fmt.Errorf("insert batch: %w", err)
 	}
 
-	columns := []string{"id", "batch_id", "correlation_id", "channel", "priority",
+	columns := []string{"id", "batch_id", "correlation_id", "trace_parent", "channel", "priority",
 		"recipient", "content", "template_id", "variables", "status", "max_attempts",
 		"next_attempt_at", "scheduled_at"}
 	rows := make([][]any, len(items))
 	for i, n := range items {
-		rows[i] = []any{n.ID, created.ID, n.CorrelationID, n.Channel, n.Priority,
+		rows[i] = []any{n.ID, created.ID, n.CorrelationID, n.TraceParent, n.Channel, n.Priority,
 			n.Recipient, n.Content, n.TemplateID, n.Variables, n.Status, n.MaxAttempts,
 			n.NextAttemptAt, n.ScheduledAt}
 	}
