@@ -245,6 +245,17 @@ Backoff handles brief blips; the breaker handles outages. Together they keep a
   notification, and sent to the provider.
 - **Health:** `/health/live` (process up, never checks dependencies) and
   `/health/ready` (Postgres and Redis reachable) on both API and worker.
+- **Live status stream:** `ws://localhost:8080/ws?batch_id=<id>` (or
+  `?notification_id=<id>`, or no filter) pushes a JSON event for every status
+  change: created, processing, sent, retrying, failed, cancelled. Workers
+  publish to Redis pub/sub and every API replica fans out to its clients.
+  It's a best-effort live view; the REST API is the source of truth.
+
+  ```bash
+  websocat 'ws://localhost:8080/ws?batch_id=<batch_id>'
+  # {"notification_id":"…","batch_id":"…","channel":"sms","status":"processing","attempt":1,"at":"…"}
+  # {"notification_id":"…","batch_id":"…","channel":"sms","status":"sent","attempt":1,"at":"…"}
+  ```
 
 Details: [ADR-026](docs/DECISIONS.md#adr-026-observability-metrics-summary-and-correlation).
 
@@ -484,6 +495,8 @@ internal/
   ratelimit/      Redis token bucket (Lua scripts)
   templating/     template compilation, variable discovery, rendering
   httpapi/        handlers, middleware, error mapping, CORS
+  events/         status events published to Redis pub/sub
+  ws/             WebSocket hub: Redis subscription fanned out to clients
   observability/  logging keys, Prometheus metrics, queue depth refresher
   health/         liveness and readiness
   platform/       connection bootstrapping, HTTP server lifecycle

@@ -33,6 +33,7 @@ Entries are added as the system is built; later entries may refine earlier ones.
 | [ADR-026](#adr-026-observability-metrics-summary-and-correlation) | Observability: metrics, summary and correlation |
 | [ADR-027](#adr-027-the-openapi-spec-is-a-tested-contract) | The OpenAPI spec is a tested contract |
 | [ADR-028](#adr-028-templates-are-immutable-and-rendered-at-create-time) | Templates are immutable and rendered at create time |
+| [ADR-029](#adr-029-live-status-stream-redis-pubsub-fanned-out-over-websocket) | Live status stream: Redis pub/sub fanned out over WebSocket |
 
 ---
 
@@ -881,3 +882,48 @@ change meaning; that's future work if marketing teams need it.
 **Safety.** `text/template` has no loops without data and can't call functions
 unless they're registered, and the variables come from JSON (no functions). The
 template body is capped at 20,000 characters and the request body at 1 MiB.
+
+---
+
+## ADR-029: Live status stream: Redis pub/sub fanned out over WebSocket
+
+**Decision.**
+- Every status change publishes a small JSON event to the Redis pub/sub channel
+  `notifications:status`:
+  - the API publishes `pending`/`scheduled` on create (a whole batch in one
+    pipelined round trip), `cancelled` on cancel, and `pending` on manual retry;
+  - the worker publishes `processing` when it starts an attempt, and `sent`,
+    `retrying` or `failed` once the result is committed.
+- Each API replica holds **one** Redis subscription and fans events out to its
+  WebSocket clients (`GET /ws?notification_id=|batch_id=`) through an in-memory
+  hub. Replicas need no coordination: each sees every event and keeps the ones
+  its clients asked for.
+- **Best-effort, by design.** Pub/sub is at-most-once: a disconnected client
+  misses events. That's fine for a live view. A client that reconnects reads
+  the current state from the REST API, which remains the source of truth.
+  Publishing has a 500ms timeout and never fails the API call or the
+  delivery that triggered it.
+- **Back-pressure:** each client has a 256-event buffer. A client that falls
+  further behind is disconnected (close 1008, "reconnect and read current
+  state") rather than slowing delivery to everyone else.
+- **Lifecycle:** pings every 30s keep idle connections alive through proxies.
+  On shutdown the hub closes every socket with 1001 (going away), since
+  `http.Server.Shutdown` doesn't track hijacked connections. Browser origins
+  come from `CORS_ALLOWED_ORIGINS`.
+
+**Measured.** In a browser on the Swagger UI origin, a batch of 2 produced
+`pending` x2, `processing` x2, `failed` (the `[mock:400]` item) and, after a
+random mock 500, `retrying` then `processing#2`, all within ~2s. Integration
+tests cover publisher → Redis → hub → WebSocket client with a batch filter,
+and graceful close.
+
+**Alternatives.**
+- *Redis Streams* (`XADD`/`XREAD`) give replay from an ID, so a client could
+  resume after reconnecting. Worth it if clients must not miss events; it costs
+  stream trimming and per-client offsets.
+- *Postgres `LISTEN/NOTIFY`* avoids Redis, but its payload limit (8 kB) and
+  delivery while a transaction is open are awkward, and it would add load to
+  the database.
+- *Server-Sent Events* would be simpler than WebSockets for one-way traffic;
+  WebSocket was asked for and leaves room for client messages (e.g. changing
+  the filter) later.
