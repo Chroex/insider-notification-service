@@ -1,7 +1,10 @@
 package httpapi
 
 import (
+	"bufio"
+	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"regexp"
 	"runtime/debug"
@@ -49,6 +52,20 @@ func (r *statusRecorder) WriteHeader(code int) {
 	r.status = code
 	r.ResponseWriter.WriteHeader(code)
 }
+
+// Hijack lets WebSocket upgrades pass through the middleware chain: the
+// upgrade needs the raw connection, which a plain wrapper would hide.
+func (r *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h, ok := r.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, errors.New("underlying ResponseWriter does not support hijacking")
+	}
+	r.status = http.StatusSwitchingProtocols
+	return h.Hijack()
+}
+
+// Unwrap exposes the wrapped writer to http.ResponseController.
+func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
 
 // requestLogger writes one structured access-log line per request.
 func requestLogger(next http.Handler) http.Handler {

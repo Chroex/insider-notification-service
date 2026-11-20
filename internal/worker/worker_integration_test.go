@@ -23,6 +23,7 @@ import (
 	promtest "github.com/prometheus/client_golang/prometheus/testutil"
 
 	"notification-service/internal/domain"
+	"notification-service/internal/events"
 	"notification-service/internal/observability"
 	"notification-service/internal/provider"
 	"notification-service/internal/queue"
@@ -858,4 +859,46 @@ func counterValue(t *testing.T, reg *prometheus.Registry, name, labelValue strin
 		}
 	}
 	return 0
+}
+
+// --- status events ---
+
+type recordingPublisher struct {
+	mu  sync.Mutex
+	evs []events.Event
+}
+
+func (r *recordingPublisher) Publish(_ context.Context, evs ...events.Event) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.evs = append(r.evs, evs...)
+}
+
+func TestStatusEvents_PublishedByWorker(t *testing.T) {
+	db.Reset(t)
+	fp := newFakeProvider(t, func(_ string, call int) int {
+		if call == 1 {
+			return http.StatusServiceUnavailable
+		}
+		return http.StatusAccepted
+	})
+	n := insertNotification(t, domain.ChannelSMS)
+	rec := &recordingPublisher{}
+	cfg := testConfig()
+	cfg.Events = rec
+	startWorker(t, fp.URL, cfg)
+	waitForStatus(t, n.ID, domain.StatusSent, 5*time.Second)
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	var got []string
+	for _, ev := range rec.evs {
+		got = append(got, fmt.Sprintf("%s#%d", ev.Status, ev.Attempt))
+	}
+	if want := "processing#1,retrying#1,processing#2,sent#2"; strings.Join(got, ",") != want {
+		t.Errorf("events = %s, want %s", strings.Join(got, ","), want)
+	}
+	if len(rec.evs) > 1 && rec.evs[1].Error == "" {
+		t.Error("retrying event should carry the error")
+	}
 }

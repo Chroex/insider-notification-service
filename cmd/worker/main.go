@@ -15,6 +15,7 @@ import (
 
 	"notification-service/internal/config"
 	"notification-service/internal/domain"
+	"notification-service/internal/events"
 	"notification-service/internal/health"
 	"notification-service/internal/observability"
 	"notification-service/internal/platform"
@@ -98,6 +99,7 @@ func run() error {
 			BreakerWindow:    cfg.Worker.BreakerWindow,
 			BreakerCooldown:  cfg.Worker.BreakerCooldown,
 			Observer:         metrics,
+			Events:           events.NewRedisPublisher(rdb, log),
 		},
 		log,
 	)

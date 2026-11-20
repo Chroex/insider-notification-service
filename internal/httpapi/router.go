@@ -9,9 +9,11 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"notification-service/internal/events"
 	"notification-service/internal/health"
 	"notification-service/internal/notification"
 	"notification-service/internal/observability"
+	"notification-service/internal/ws"
 )
 
 // Options are the router's dependencies.
@@ -23,8 +25,12 @@ type Options struct {
 	Registry *prometheus.Registry
 	Checks   []health.Check
 	// CORSAllowedOrigins are browser origins allowed to call the API
-	// (e.g. Swagger UI). Empty disables CORS.
+	// (e.g. Swagger UI) and to open the WebSocket. Empty disables CORS.
 	CORSAllowedOrigins []string
+	// Events publishes status changes (create, cancel, retry); nil = discard.
+	Events events.Publisher
+	// Hub serves GET /ws. nil disables the endpoint (503).
+	Hub *ws.Hub
 }
 
 // NewRouter wires routes and middleware. Middleware order, outermost first:
@@ -37,7 +43,10 @@ func NewRouter(opts Options) http.Handler {
 		reg = observability.NewRegistry()
 	}
 	metrics := observability.NewAPIMetrics(reg)
-	h := &handlers{svc: opts.Service, metrics: metrics}
+	if opts.Events == nil {
+		opts.Events = events.Nop{}
+	}
+	h := &handlers{svc: opts.Service, metrics: metrics, events: opts.Events, hub: opts.Hub, origins: opts.CORSAllowedOrigins}
 	mux := http.NewServeMux()
 
 	health.Register(mux, 2*time.Second, opts.Checks...)
@@ -72,6 +81,7 @@ func (h *handlers) routes() []route {
 		{"GET /api/v1/metrics/summary", h.metricsSummary},
 		{"POST /api/v1/templates", h.createTemplate},
 		{"GET /api/v1/templates/{id}", h.getTemplate},
+		{"GET /ws", h.statusStream},
 	}
 }
 

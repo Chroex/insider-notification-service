@@ -9,9 +9,11 @@ import (
 	"github.com/google/uuid"
 
 	"notification-service/internal/domain"
+	"notification-service/internal/events"
 	"notification-service/internal/notification"
 	"notification-service/internal/observability"
 	"notification-service/internal/store"
+	"notification-service/internal/ws"
 )
 
 const (
@@ -26,6 +28,9 @@ const (
 type handlers struct {
 	svc     *notification.Service
 	metrics *observability.APIMetrics
+	events  events.Publisher
+	hub     *ws.Hub
+	origins []string
 }
 
 // POST /api/v1/notifications
@@ -46,6 +51,7 @@ func (h *handlers) createNotification(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Location", "/api/v1/notifications/"+n.ID.String())
 	if created {
 		h.metrics.NotificationCreated(n.Channel, n.Priority)
+		h.events.Publish(r.Context(), events.FromNotification(n, time.Now()))
 	}
 	if !created {
 		w.Header().Set(headerReplayed, "true")
@@ -87,9 +93,18 @@ func (h *handlers) createBatch(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Location", "/api/v1/batches/"+result.Batch.ID.String())
 	if created {
-		for _, in := range inputs {
+		now := time.Now().UTC()
+		evs := make([]events.Event, len(inputs))
+		for i, in := range inputs {
 			h.metrics.NotificationCreated(domain.Channel(in.Channel), notification.EffectivePriority(in.Priority))
+			status := domain.StatusPending
+			if in.ScheduledAt != nil {
+				status = domain.StatusScheduled
+			}
+			evs[i] = events.Event{NotificationID: result.IDs[i], BatchID: &result.Batch.ID, Channel: in.Channel,
+				Status: string(status), CorrelationID: observability.CorrelationID(r.Context()), At: now}
 		}
+		h.events.Publish(r.Context(), evs...) // one Redis round trip for the whole batch
 	}
 	if !created {
 		w.Header().Set(headerReplayed, "true")
@@ -124,6 +139,7 @@ func (h *handlers) cancelNotification(w http.ResponseWriter, r *http.Request) {
 		writeServiceError(w, r, err)
 		return
 	}
+	h.events.Publish(r.Context(), events.FromNotification(n, time.Now()))
 	writeJSON(w, http.StatusOK, toNotificationResponse(n))
 }
 
@@ -138,6 +154,7 @@ func (h *handlers) retryNotification(w http.ResponseWriter, r *http.Request) {
 		writeServiceError(w, r, err)
 		return
 	}
+	h.events.Publish(r.Context(), events.FromNotification(n, time.Now()))
 	writeJSON(w, http.StatusOK, toNotificationResponse(n))
 }
 
@@ -212,6 +229,24 @@ func (h *handlers) getTemplate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, toTemplateResponse(t))
+}
+
+// GET /ws?notification_id=&batch_id=
+//
+// Streams status events as JSON text messages. Filters are optional; with
+// none, every event is sent.
+func (h *handlers) statusStream(w http.ResponseWriter, r *http.Request) {
+	if h.hub == nil {
+		writeError(w, r, http.StatusServiceUnavailable, codeInternal, "status stream is not enabled", nil)
+		return
+	}
+	filter, badParam, ok := ws.ParseFilter(r)
+	if !ok {
+		writeError(w, r, http.StatusBadRequest, codeInvalidParameter, "invalid query parameters",
+			[]domain.FieldError{{Field: badParam, Message: "must be a UUID"}})
+		return
+	}
+	h.hub.Serve(w, r, filter, h.origins)
 }
 
 // notFound returns the standard error body for unknown routes.

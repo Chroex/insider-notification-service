@@ -22,6 +22,7 @@ import (
 	"github.com/getkin/kin-openapi/routers"
 	legacyrouter "github.com/getkin/kin-openapi/routers/legacy"
 
+	"notification-service/internal/events"
 	"notification-service/internal/httpapi"
 	"notification-service/internal/notification"
 	"notification-service/internal/store"
@@ -30,8 +31,9 @@ import (
 )
 
 var (
-	db     *testutil.Postgres
-	server *httptest.Server
+	db       *testutil.Postgres
+	server   *httptest.Server
+	recorder = &recordingPublisher{}
 	// spec routes requests to api/openapi.yaml operations so every response
 	// in this suite is validated against the documented contract.
 	spec routers.Router
@@ -53,6 +55,7 @@ func TestMain(m *testing.M) {
 	server = httptest.NewServer(httpapi.NewRouter(httpapi.Options{
 		Service: svc,
 		Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Events:  recorder,
 	}))
 	if spec, err = loadSpecRouter(server.URL); err != nil {
 		fmt.Fprintln(os.Stderr, "load openapi spec:", err)
@@ -965,5 +968,55 @@ func TestTemplates_InBatchAndIdempotency(t *testing.T) {
 	id := first.Body["items"].([]any)[1].(map[string]any)["id"].(string)
 	if got := call(t, "GET", "/api/v1/notifications/"+id, nil).Body["content"]; got != "Elif, flash sale ends at 18:00!" {
 		t.Errorf("content = %v", got)
+	}
+}
+
+// --- status events ---
+
+// recordingPublisher captures published events.
+type recordingPublisher struct {
+	mu  sync.Mutex
+	evs []events.Event
+}
+
+func (r *recordingPublisher) Publish(_ context.Context, evs ...events.Event) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.evs = append(r.evs, evs...)
+}
+
+func (r *recordingPublisher) take() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]string, len(r.evs))
+	for i, ev := range r.evs {
+		out[i] = ev.Status
+	}
+	r.evs = nil
+	return out
+}
+
+func TestStatusEvents_PublishedByAPI(t *testing.T) {
+	db.Reset(t)
+	recorder.take()
+
+	id := call(t, "POST", "/api/v1/notifications", sms("hi"), "Idempotency-Key", "ev-1").Body["id"].(string)
+	call(t, "POST", "/api/v1/notifications", sms("hi"), "Idempotency-Key", "ev-1") // replay: no event
+	call(t, "POST", "/api/v1/notifications/"+id+"/cancel", nil)
+	call(t, "POST", "/api/v1/notifications/"+id+"/cancel", nil) // 409: no event
+	later := sms("later")
+	later["scheduled_at"] = time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	call(t, "POST", "/api/v1/notifications/batch", map[string]any{"notifications": []any{sms("a"), later}})
+
+	if got := strings.Join(recorder.take(), ","); got != "pending,cancelled,pending,scheduled" {
+		t.Errorf("published statuses = %s", got)
+	}
+}
+
+func TestStatusStream_DisabledWithoutHub(t *testing.T) {
+	// The test router has no hub (Redis), so the endpoint reports itself
+	// unavailable instead of hanging; the response is checked against the spec.
+	if r := call(t, "GET", "/ws", nil); r.Status != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", r.Status)
 	}
 }

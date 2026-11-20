@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"notification-service/internal/domain"
+	"notification-service/internal/events"
 	"notification-service/internal/observability"
 	"notification-service/internal/provider"
 	"notification-service/internal/queue"
@@ -60,6 +61,8 @@ type Config struct {
 
 	// Observer receives delivery events for metrics. Optional.
 	Observer Observer
+	// Events publishes status changes for the live WebSocket stream. Optional.
+	Events events.Publisher
 }
 
 // Observer is notified of delivery events; implemented by
@@ -105,6 +108,9 @@ type Worker struct {
 func New(q Queue, s Sender, limiter RateLimiter, cfg Config, log *slog.Logger) *Worker {
 	if cfg.Observer == nil {
 		cfg.Observer = NopObserver{}
+	}
+	if cfg.Events == nil {
+		cfg.Events = events.Nop{}
 	}
 	w := &Worker{queue: q, sender: s, limiter: limiter, cfg: cfg, log: log, now: time.Now,
 		breakers: make(map[domain.Channel]*Breaker, len(cfg.Channels))}
@@ -281,6 +287,8 @@ func (w *Worker) process(stopCtx, sendCtx context.Context, job domain.Notificati
 		return
 	}
 
+	w.cfg.Events.Publish(sendCtx, events.FromNotification(job, w.now())) // status: processing
+
 	start := w.now()
 	res, sendErr := w.sender.Send(sendCtx, provider.Message{
 		NotificationID: job.ID,
@@ -314,7 +322,15 @@ func (w *Worker) process(stopCtx, sendCtx context.Context, job domain.Notificati
 	}
 
 	w.observeDecision(job, decision)
+	w.publishDecision(sendCtx, job, decision)
 	logDecision(log, decision, c, duration)
+}
+
+// publishDecision streams the committed status change to live clients.
+func (w *Worker) publishDecision(ctx context.Context, job domain.Notification, d Decision) {
+	updated := job
+	updated.Status, updated.LastError = d.Status, d.LastError
+	w.cfg.Events.Publish(ctx, events.FromNotification(updated, w.now()))
 }
 
 // observeDecision reports the committed status change to the observer.

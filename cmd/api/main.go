@@ -13,12 +13,14 @@ import (
 	"time"
 
 	"notification-service/internal/config"
+	"notification-service/internal/events"
 	"notification-service/internal/health"
 	"notification-service/internal/httpapi"
 	"notification-service/internal/notification"
 	"notification-service/internal/observability"
 	"notification-service/internal/platform"
 	"notification-service/internal/store"
+	"notification-service/internal/ws"
 )
 
 func main() {
@@ -56,11 +58,17 @@ func run() error {
 		BatchMaxSize: cfg.BatchMaxSize,
 		MaxAttempts:  cfg.MaxAttempts,
 	})
+	// One Redis subscription per API process feeds every WebSocket client.
+	hub := ws.NewHub(log)
+	go hub.Run(ctx, rdb)
+
 	router := httpapi.NewRouter(httpapi.Options{
 		Service:            svc,
 		Logger:             log,
 		Registry:           observability.NewRegistry(),
 		CORSAllowedOrigins: cfg.CORSAllowedOrigins,
+		Events:             events.NewRedisPublisher(rdb, log),
+		Hub:                hub,
 		Checks: []health.Check{
 			{Name: "postgres", Ping: db.Ping},
 			{Name: "redis", Ping: func(ctx context.Context) error { return rdb.Ping(ctx).Err() }},
