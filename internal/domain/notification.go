@@ -16,7 +16,9 @@ type Notification struct {
 	Channel           Channel
 	Priority          Priority
 	Recipient         string
-	Content           string
+	Content           string // final text; rendered at create time when a template is used
+	TemplateID        *uuid.UUID
+	Variables         map[string]any
 	Status            Status
 	Attempts          int
 	MaxAttempts       int
@@ -76,3 +78,14 @@ type QueueBucket struct {
 
 // ActiveStatuses are the non-terminal statuses that make up queue depth.
 var ActiveStatuses = []Status{StatusScheduled, StatusPending, StatusProcessing, StatusRetrying}
+
+// Template is a reusable message body (Go text/template syntax). Templates
+// are immutable once created, so a notification rendered from one never
+// changes meaning later.
+type Template struct {
+	ID        uuid.UUID
+	Name      string
+	Channel   Channel
+	Body      string
+	CreatedAt time.Time
+}

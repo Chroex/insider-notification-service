@@ -57,11 +57,13 @@ func (s *Store) InsertBatch(ctx context.Context, b domain.Batch, items []domain.
 	}
 
 	columns := []string{"id", "batch_id", "correlation_id", "channel", "priority",
-		"recipient", "content", "status", "max_attempts", "next_attempt_at", "scheduled_at"}
+		"recipient", "content", "template_id", "variables", "status", "max_attempts",
+		"next_attempt_at", "scheduled_at"}
 	rows := make([][]any, len(items))
 	for i, n := range items {
 		rows[i] = []any{n.ID, created.ID, n.CorrelationID, n.Channel, n.Priority,
-			n.Recipient, n.Content, n.Status, n.MaxAttempts, n.NextAttemptAt, n.ScheduledAt}
+			n.Recipient, n.Content, n.TemplateID, n.Variables, n.Status, n.MaxAttempts,
+			n.NextAttemptAt, n.ScheduledAt}
 	}
 	if _, err := tx.CopyFrom(ctx, pgx.Identifier{"notifications"}, columns, pgx.CopyFromRows(rows)); err != nil {
 		return domain.Batch{}, false, fmt.Errorf("copy batch notifications: %w", err)

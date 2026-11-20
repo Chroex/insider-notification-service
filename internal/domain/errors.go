@@ -12,6 +12,8 @@ var (
 	// ErrIdempotencyConflict: the Idempotency-Key was already used with a
 	// different request payload.
 	ErrIdempotencyConflict = errors.New("idempotency key reused with a different payload")
+	// ErrTemplateNameTaken: template names are unique.
+	ErrTemplateNameTaken = errors.New("template name already exists")
 )
 
 // InvalidTransitionError reports a status change that is not allowed from
