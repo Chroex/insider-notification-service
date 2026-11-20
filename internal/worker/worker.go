@@ -56,10 +56,35 @@ type Config struct {
 	// Circuit breaker per channel (see Breaker).
 	BreakerThreshold int
 	BreakerCooldown  time.Duration
-	// OnBreakerChange, if set, is called on every breaker transition
-	// (used for metrics).
-	OnBreakerChange func(ch domain.Channel, from, to BreakerState)
+
+	// Observer receives delivery events for metrics. Optional.
+	Observer Observer
 }
+
+// Observer is notified of delivery events; implemented by
+// observability.WorkerMetrics. Defined here, on the consumer side, so the
+// engine has no Prometheus dependency and tests can plug in a fake.
+type Observer interface {
+	// AttemptFinished is called for every provider call, whether or not its
+	// result could be recorded (the call happened either way).
+	AttemptFinished(ch domain.Channel, outcome domain.AttemptOutcome, providerLatency time.Duration)
+	// NotificationSent / NotificationFailed are called once the new status
+	// is committed.
+	NotificationSent(ch domain.Channel, endToEnd time.Duration)
+	NotificationFailed(ch domain.Channel, reason string)
+	LeasesReaped(requeued int, failedByChannel map[domain.Channel]int)
+	// BreakerStateChanged receives int(BreakerState): 0 closed, 1 open, 2 half-open.
+	BreakerStateChanged(ch domain.Channel, state int)
+}
+
+// NopObserver ignores every event.
+type NopObserver struct{}
+
+func (NopObserver) AttemptFinished(domain.Channel, domain.AttemptOutcome, time.Duration) {}
+func (NopObserver) NotificationSent(domain.Channel, time.Duration)                       {}
+func (NopObserver) NotificationFailed(domain.Channel, string)                            {}
+func (NopObserver) LeasesReaped(int, map[domain.Channel]int)                             {}
+func (NopObserver) BreakerStateChanged(domain.Channel, int)                              {}
 
 // persistTimeout bounds the DB write after a send. It uses a context that is
 // not cancelled by shutdown: once the provider has answered, losing the
@@ -77,6 +102,9 @@ type Worker struct {
 }
 
 func New(q Queue, s Sender, limiter RateLimiter, cfg Config, log *slog.Logger) *Worker {
+	if cfg.Observer == nil {
+		cfg.Observer = NopObserver{}
+	}
 	w := &Worker{queue: q, sender: s, limiter: limiter, cfg: cfg, log: log, now: time.Now,
 		breakers: make(map[domain.Channel]*Breaker, len(cfg.Channels))}
 	for _, ch := range cfg.Channels {
@@ -87,9 +115,7 @@ func New(q Queue, s Sender, limiter RateLimiter, cfg Config, log *slog.Logger) *
 			}
 			log.Log(context.Background(), level, "circuit breaker state changed",
 				observability.KeyChannel, ch, "from", from.String(), "to", to.String())
-			if cfg.OnBreakerChange != nil {
-				cfg.OnBreakerChange(ch, from, to)
-			}
+			cfg.Observer.BreakerStateChanged(ch, int(to))
 		})
 	}
 	return w
@@ -265,6 +291,7 @@ func (w *Worker) process(stopCtx, sendCtx context.Context, job domain.Notificati
 	duration := w.now().Sub(start)
 
 	c := Classify(sendErr)
+	w.cfg.Observer.AttemptFinished(job.Channel, c.Outcome, duration)
 	if sendCtx.Err() == nil { // a send aborted by our own shutdown says nothing about provider health
 		breaker.Record(c.Outcome)
 	}
@@ -285,7 +312,24 @@ func (w *Worker) process(stopCtx, sendCtx context.Context, job domain.Notificati
 		return
 	}
 
+	w.observeDecision(job, decision)
 	logDecision(log, decision, c, duration)
+}
+
+// observeDecision reports the committed status change to the observer.
+func (w *Worker) observeDecision(job domain.Notification, d Decision) {
+	switch d.Status {
+	case domain.StatusSent:
+		// Measured from when the notification became due, so a send
+		// scheduled for tomorrow doesn't look like a day of latency.
+		due := job.CreatedAt
+		if job.ScheduledAt != nil && job.ScheduledAt.After(due) {
+			due = *job.ScheduledAt
+		}
+		w.cfg.Observer.NotificationSent(job.Channel, w.now().Sub(due))
+	case domain.StatusFailed:
+		w.cfg.Observer.NotificationFailed(job.Channel, d.FailReason)
+	}
 }
 
 // refund returns unused tokens. Failure only costs a little throughput (the
@@ -322,6 +366,7 @@ func (w *Worker) reaperLoop(ctx context.Context) {
 			w.log.Error("reaper failed", "error", err)
 		case res.Requeued > 0 || res.Failed > 0:
 			w.log.Warn("reaped expired leases", "requeued", res.Requeued, "failed", res.Failed)
+			w.cfg.Observer.LeasesReaped(res.Requeued, res.FailedByChannel)
 		}
 		select {
 		case <-ctx.Done():

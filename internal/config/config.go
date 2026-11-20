@@ -79,6 +79,9 @@ type Worker struct {
 	// on a channel, stop sending on it for BreakerCooldown, then probe.
 	BreakerThreshold int
 	BreakerCooldown  time.Duration
+
+	// QueueDepthInterval is how often the queue_depth gauge is refreshed.
+	QueueDepthInterval time.Duration
 }
 
 // Load reads configuration using lookup (normally os.LookupEnv).
@@ -113,6 +116,8 @@ func Load(lookup LookupFunc) (Config, error) {
 			RetryMaxDelay:    r.duration("RETRY_MAX_DELAY", 5*time.Minute),
 			BreakerThreshold: r.int("BREAKER_FAILURE_THRESHOLD", 5),
 			BreakerCooldown:  r.duration("BREAKER_COOLDOWN", 30*time.Second),
+
+			QueueDepthInterval: r.duration("QUEUE_DEPTH_INTERVAL", 15*time.Second),
 		},
 		RateLimit: RateLimit{
 			PerSecond: map[string]float64{
@@ -146,6 +151,7 @@ func Load(lookup LookupFunc) (Config, error) {
 	// to a second worker while the first is still sending it.
 	r.require(w.LeaseDuration >= 2*w.ProviderTimeout,
 		"LEASE_DURATION (%v) must be at least twice PROVIDER_TIMEOUT (%v)", w.LeaseDuration, w.ProviderTimeout)
+	r.require(w.QueueDepthInterval > 0, "QUEUE_DEPTH_INTERVAL must be positive")
 	r.require(w.RetryFactor >= 1, "RETRY_BACKOFF_FACTOR must be >= 1")
 	r.require(w.RetryMaxDelay >= w.RetryBaseDelay, "RETRY_MAX_DELAY must be >= RETRY_BASE_DELAY")
 	r.require(w.BreakerThreshold >= 1 && w.BreakerCooldown > 0,

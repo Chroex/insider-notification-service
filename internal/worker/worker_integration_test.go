@@ -19,8 +19,11 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
+	promtest "github.com/prometheus/client_golang/prometheus/testutil"
 
 	"notification-service/internal/domain"
+	"notification-service/internal/observability"
 	"notification-service/internal/provider"
 	"notification-service/internal/queue"
 	"notification-service/internal/ratelimit"
@@ -697,6 +700,18 @@ func TestRetryAfter_IsHonoured(t *testing.T) {
 	}
 }
 
+// breakerWatcher signals when the SMS breaker opens.
+type breakerWatcher struct {
+	worker.NopObserver
+	opened chan<- struct{}
+}
+
+func (b breakerWatcher) BreakerStateChanged(ch domain.Channel, state int) {
+	if ch == domain.ChannelSMS && worker.BreakerState(state) == worker.BreakerOpen {
+		b.opened <- struct{}{}
+	}
+}
+
 func TestCircuitBreaker_StopsHammeringAndRecovers(t *testing.T) {
 	db.Reset(t)
 	var providerDown atomic.Bool
@@ -716,11 +731,7 @@ func TestCircuitBreaker_StopsHammeringAndRecovers(t *testing.T) {
 	cfg := testConfig()
 	cfg.Concurrency, cfg.ClaimBatchSize = 1, 1 // sequential, so the count of calls is exact
 	cfg.BreakerThreshold, cfg.BreakerCooldown = 3, 700*time.Millisecond
-	cfg.OnBreakerChange = func(ch domain.Channel, _, to worker.BreakerState) {
-		if ch == domain.ChannelSMS && to == worker.BreakerOpen {
-			opened <- struct{}{}
-		}
-	}
+	cfg.Observer = breakerWatcher{opened: opened}
 	w, _ := startWorkerHandle(t, fp.URL, cfg, worker.Unlimited{})
 
 	select {
@@ -774,4 +785,76 @@ func TestCircuitBreaker_StopsHammeringAndRecovers(t *testing.T) {
 	if c := fp.totalCalls(); c != total+3 {
 		t.Errorf("total provider calls = %d, want %d (3 failures + 1 send each)", c, total+3)
 	}
+}
+
+// --- metrics ---
+
+func TestMetrics_RecordedForDeliveries(t *testing.T) {
+	db.Reset(t)
+	var failID atomic.Value
+	failID.Store("")
+	fp := newFakeProvider(t, func(id string, _ int) int {
+		if id == failID.Load().(string) {
+			return http.StatusBadRequest
+		}
+		return http.StatusAccepted
+	})
+	insertNotification(t, domain.ChannelSMS)
+	insertNotification(t, domain.ChannelSMS)
+	bad := insertNotification(t, domain.ChannelEmail, func(x *domain.Notification) { x.Recipient = "u@example.com" })
+	failID.Store(bad.ID.String())
+
+	reg := prometheus.NewRegistry()
+	metrics := observability.NewWorkerMetrics(reg)
+	cfg := testConfig()
+	cfg.Observer = metrics
+	startWorker(t, fp.URL, cfg)
+	waitForStatus(t, bad.ID, domain.StatusFailed, 5*time.Second)
+	deadline := time.Now().Add(5 * time.Second)
+	for counterValue(t, reg, "notifications_sent_total", "sms") < 2 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	err := promtest.GatherAndCompare(reg, strings.NewReader(`
+# HELP delivery_attempts_total Provider calls by outcome (success, retryable_error, permanent_error).
+# TYPE delivery_attempts_total counter
+delivery_attempts_total{channel="email",outcome="permanent_error"} 1
+delivery_attempts_total{channel="sms",outcome="success"} 2
+# HELP notifications_failed_total Notifications moved to failed, by reason (permanent_error, max_attempts, lease_expired).
+# TYPE notifications_failed_total counter
+notifications_failed_total{channel="email",reason="permanent_error"} 1
+# HELP notifications_sent_total Notifications accepted by the provider.
+# TYPE notifications_sent_total counter
+notifications_sent_total{channel="email"} 0
+notifications_sent_total{channel="push"} 0
+notifications_sent_total{channel="sms"} 2
+`), "delivery_attempts_total", "notifications_failed_total", "notifications_sent_total")
+	if err != nil {
+		t.Error(err)
+	}
+	if n, err := promtest.GatherAndCount(reg, "end_to_end_latency_seconds"); err != nil || n != 1 {
+		t.Errorf("end_to_end_latency_seconds series = %d, want 1 (sms)", n)
+	}
+}
+
+// counterValue reads one counter series (matched by any label value).
+func counterValue(t *testing.T, reg *prometheus.Registry, name, labelValue string) float64 {
+	t.Helper()
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range families {
+		if f.GetName() != name {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			for _, l := range m.GetLabel() {
+				if l.GetValue() == labelValue {
+					return m.GetCounter().GetValue()
+				}
+			}
+		}
+	}
+	return 0
 }

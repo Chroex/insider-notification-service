@@ -21,8 +21,12 @@ import (
 	"notification-service/internal/provider"
 	"notification-service/internal/queue"
 	"notification-service/internal/ratelimit"
+	"notification-service/internal/store"
 	"notification-service/internal/worker"
 )
+
+// Compile-time check: the Prometheus metrics satisfy the engine's observer.
+var _ worker.Observer = (*observability.WorkerMetrics)(nil)
 
 func main() {
 	if err := run(); err != nil {
@@ -53,7 +57,11 @@ func run() error {
 	}
 	defer func() { _ = rdb.Close() }()
 
+	registry := observability.NewRegistry()
+	metrics := observability.NewWorkerMetrics(registry)
+
 	admin := http.NewServeMux()
+	admin.Handle("GET /metrics", observability.MetricsHandler(registry))
 	health.Register(admin, 2*time.Second,
 		health.Check{Name: "postgres", Ping: db.Ping},
 		health.Check{Name: "redis", Ping: func(ctx context.Context) error { return rdb.Ping(ctx).Err() }},
@@ -88,9 +96,12 @@ func run() error {
 			}},
 			BreakerThreshold: cfg.Worker.BreakerThreshold,
 			BreakerCooldown:  cfg.Worker.BreakerCooldown,
+			Observer:         metrics,
 		},
 		log,
 	)
+
+	go observability.RefreshQueueDepth(ctx, cfg.Worker.QueueDepthInterval, store.New(db).QueueDepth, metrics, log)
 
 	engineDone := make(chan struct{})
 	go func() {
