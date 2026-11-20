@@ -20,6 +20,7 @@ import (
 	"notification-service/internal/platform"
 	"notification-service/internal/provider"
 	"notification-service/internal/queue"
+	"notification-service/internal/ratelimit"
 	"notification-service/internal/worker"
 )
 
@@ -63,9 +64,15 @@ func run() error {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
+	limits := make(map[domain.Channel]ratelimit.Limit, len(domain.Channels))
+	for _, ch := range domain.Channels {
+		limits[ch] = ratelimit.Limit{PerSecond: cfg.RateLimit.PerSecond[string(ch)], Burst: cfg.RateLimit.Burst}
+	}
+
 	engine := worker.New(
 		queue.New(db),
 		provider.NewClient(cfg.ProviderURL, cfg.Worker.ProviderTimeout),
+		ratelimit.New(rdb, limits, ""),
 		worker.Config{
 			Channels:        domain.Channels,
 			Concurrency:     cfg.Worker.Concurrency,

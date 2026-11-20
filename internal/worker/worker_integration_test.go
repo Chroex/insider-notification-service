@@ -128,7 +128,7 @@ func testConfig() worker.Config {
 // returns a stop function that blocks until Run has returned.
 func startWorker(t *testing.T, providerURL string, cfg worker.Config) (stop func()) {
 	t.Helper()
-	w := worker.New(queue.New(db.Pool), provider.NewClient(providerURL, 2*time.Second), cfg,
+	w := worker.New(queue.New(db.Pool), provider.NewClient(providerURL, 2*time.Second), worker.Unlimited{}, cfg,
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})

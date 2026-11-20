@@ -27,6 +27,21 @@ type Sender interface {
 	Send(ctx context.Context, msg provider.Message) (provider.Result, error)
 }
 
+// RateLimiter hands out per-channel send permits; implemented by
+// ratelimit.Limiter (Redis token bucket shared by all replicas).
+type RateLimiter interface {
+	// Acquire blocks until it can grant between 1 and n permits.
+	Acquire(ctx context.Context, ch domain.Channel, n int) (int, error)
+	// Refund returns permits that were acquired but not used.
+	Refund(ctx context.Context, ch domain.Channel, n int) error
+}
+
+// Unlimited is a RateLimiter that never limits (tests, local experiments).
+type Unlimited struct{}
+
+func (Unlimited) Acquire(_ context.Context, _ domain.Channel, n int) (int, error) { return n, nil }
+func (Unlimited) Refund(context.Context, domain.Channel, int) error               { return nil }
+
 // Config tunes the worker.
 type Config struct {
 	Channels        []domain.Channel
@@ -45,15 +60,16 @@ type Config struct {
 const persistTimeout = 5 * time.Second
 
 type Worker struct {
-	queue  Queue
-	sender Sender
-	cfg    Config
-	log    *slog.Logger
-	now    func() time.Time
+	queue   Queue
+	sender  Sender
+	limiter RateLimiter
+	cfg     Config
+	log     *slog.Logger
+	now     func() time.Time
 }
 
-func New(q Queue, s Sender, cfg Config, log *slog.Logger) *Worker {
-	return &Worker{queue: q, sender: s, cfg: cfg, log: log, now: time.Now}
+func New(q Queue, s Sender, limiter RateLimiter, cfg Config, log *slog.Logger) *Worker {
+	return &Worker{queue: q, sender: s, limiter: limiter, cfg: cfg, log: log, now: time.Now}
 }
 
 // Run processes notifications until ctx is cancelled, then shuts down
@@ -101,9 +117,14 @@ func (w *Worker) Run(ctx context.Context) {
 	}
 }
 
-// claimLoop runs per channel. It only claims as many rows as it has free
-// send slots, so a claimed row is never left waiting under a lease while
-// other sends finish.
+// claimLoop runs per channel. Each iteration:
+//  1. waits for free send slots (local concurrency),
+//  2. takes that many rate-limit tokens (global, shared via Redis),
+//  3. claims at most that many rows, and refunds tokens it did not use.
+//
+// Tokens are taken *before* claiming so a claimed row never sits waiting
+// for a token while its lease ticks down, and so the claim never takes
+// more rows than we are allowed to send right now.
 func (w *Worker) claimLoop(ctx, sendCtx context.Context, ch domain.Channel, inflight *sync.WaitGroup) {
 	log := w.log.With(observability.KeyChannel, ch)
 	slots := make(chan struct{}, w.cfg.Concurrency)
@@ -114,8 +135,25 @@ func (w *Worker) claimLoop(ctx, sendCtx context.Context, ch domain.Channel, infl
 			return // shutting down
 		}
 
-		jobs, err := w.queue.Claim(ctx, ch, n, w.cfg.LeaseDuration)
-		releaseSlots(slots, n-len(jobs))
+		tokens, err := w.limiter.Acquire(ctx, ch, n)
+		if err != nil {
+			releaseSlots(slots, n)
+			if ctx.Err() != nil {
+				return
+			}
+			// Fail closed: without Redis we cannot prove we are under the
+			// provider's limit, and getting throttled or banned is worse
+			// than pausing this channel for a moment.
+			log.Error("rate limiter unavailable, pausing channel", "error", err)
+			sleep(ctx, w.cfg.PollInterval)
+			continue
+		}
+		releaseSlots(slots, n-tokens)
+
+		jobs, err := w.queue.Claim(ctx, ch, tokens, w.cfg.LeaseDuration)
+		unused := tokens - len(jobs)
+		releaseSlots(slots, unused)
+		w.refund(log, ch, unused)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -187,6 +225,19 @@ func (w *Worker) process(stopCtx, sendCtx context.Context, job domain.Notificati
 	}
 
 	logDecision(log, decision, c, duration)
+}
+
+// refund returns unused tokens. Failure only costs a little throughput (the
+// tokens refill anyway), so it is logged, not retried.
+func (w *Worker) refund(log *slog.Logger, ch domain.Channel, n int) {
+	if n <= 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := w.limiter.Refund(ctx, ch, n); err != nil {
+		log.Warn("rate limit refund failed", "error", err, "tokens", n)
+	}
 }
 
 func (w *Worker) release(log *slog.Logger, job domain.Notification) {
