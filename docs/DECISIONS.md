@@ -353,3 +353,127 @@ the provider; claiming we cancelled it would be a lie.
   enforces idempotency; `internal/store` owns SQL. The service depends on a
   `Store` interface defined on the consumer side, so its decision logic is unit
   tested with a fake.
+
+---
+
+## ADR-017: Claiming work: one short statement, bounded by free send slots
+
+**Decision.** Each channel has one claim loop and a semaphore of
+`WORKER_CONCURRENCY` send slots. The loop waits for at least one free slot,
+grabs up to `CLAIM_BATCH_SIZE` free slots, and claims exactly that many rows:
+
+```sql
+WITH due AS (
+  SELECT id FROM notifications
+  WHERE status IN ('scheduled','pending','retrying') AND channel = $1
+    AND next_attempt_at <= now()
+  ORDER BY priority_rank, next_attempt_at
+  LIMIT $2
+  FOR UPDATE SKIP LOCKED)
+UPDATE notifications n
+SET status = 'processing', attempts = n.attempts + 1,
+    locked_until = now() + <lease>
+FROM due WHERE n.id = due.id
+RETURNING ...
+```
+
+Each claimed row gets its own goroutine; the slot is freed when the send is
+recorded. An empty claim sleeps `POLL_INTERVAL` (500ms) before trying again.
+
+**Why.**
+- **Never hold a transaction across HTTP.** The statement commits in
+  milliseconds; the provider call happens afterwards. Holding row locks for a
+  5-second provider call would pin connections and block vacuum.
+- **SKIP LOCKED** lets N workers (goroutines or replicas) claim disjoint rows
+  without waiting on each other. Tested: two workers, 300 notifications, each
+  delivered exactly once.
+- **Claiming only as many rows as there are free slots** means a claimed row
+  never sits waiting for a slot while its lease ticks down.
+- **Per-channel loops** isolate channels: a slow SMS provider cannot starve
+  email sends.
+
+**Alternatives.** One goroutine per slot each claiming one row (simpler, but
+one query per message and N idle pollers per channel). `LISTEN/NOTIFY` to wake
+idle workers instantly instead of polling: worth adding if 500ms latency
+matters; polling is simpler and self-healing.
+
+---
+
+## ADR-018: Leases, fencing and the reaper: delivery is at-least-once
+
+**Context.** A worker can crash (OOM, `kill -9`, node loss) after claiming a
+row, possibly after the provider received the message but before we recorded
+it.
+
+**Decision.**
+- A claim sets `locked_until = now() + LEASE_DURATION` (30s). A reaper loop
+  in every worker (every `REAPER_INTERVAL`, 10s) moves `processing` rows with an
+  expired lease back to `pending`, or to `failed` if the attempt budget is
+  spent. The reaper is idempotent, so running it on every replica is safe.
+- **Fencing token:** the claim increments `attempts`, and every completion
+  UPDATE requires `status = 'processing' AND attempts = <my attempt>`. A worker
+  that stalls past its lease cannot overwrite the result of the worker that
+  re-claimed the row; it gets `ErrLeaseLost`. Its attempt is still written to
+  `delivery_attempts`, because the call really happened. (Tested.)
+- `LEASE_DURATION >= 2 x PROVIDER_TIMEOUT` is enforced at startup, so a healthy
+  send can never outlive its lease.
+
+**Consequence: at-least-once delivery.** If a worker dies after the provider
+accepted a message but before the result was committed, the reaper re-queues
+the row and it is sent again. Verified manually: `kill -9` with 8 sends in
+flight → all 8 re-queued after the lease and delivered again (twice in total).
+At-most-once (mark sent *before* calling) would silently lose messages
+instead, which is worse for OTPs and order updates.
+
+**How duplicates are minimised.**
+1. API idempotency keys stop clients from creating duplicates (ADR-011).
+2. Conditional, fenced state transitions stop *our own* components from
+   double-processing a row (claim, cancel, complete, reaper).
+3. Every provider request carries `X-Notification-ID: <our uuid>`, a stable
+   idempotency key a real provider (Twilio, SES, FCM) can use to drop the
+   duplicate on its side. This is the only way to get effectively-once
+   delivery end to end.
+4. The window is small: only crashes between the provider's answer and our
+   commit (milliseconds) produce duplicates.
+
+---
+
+## ADR-019: Error classification and attempt accounting
+
+**Decision.**
+- *Retryable:* no HTTP response (connection errors, DNS, per-attempt timeout,
+  cancellation), 5xx, 429, 408.
+- *Permanent:* any other 4xx, plus unexpected 1xx/3xx. These are failed
+  immediately: an identical request cannot succeed, and retrying wastes quota
+  and can get us rate-limited or flagged by the provider.
+- *Success:* any 2xx. The brief's provider returns 202; webhook.site defaults to
+  200, so we accept both and store `messageId` when present.
+- An attempt is counted when it is *claimed* (that number is the fencing
+  token). A job released on graceful shutdown before its send started has the
+  attempt refunded. A job reaped after a crash keeps it, because we can't know
+  whether the provider got it.
+- `Retry-After` (seconds or HTTP-date) is honoured when it asks for longer than
+  our own delay.
+
+Phase 3 uses a fixed `RETRY_BASE_DELAY`; exponential backoff with jitter
+replaces it later behind the same `RetryPolicy.Decide` call.
+
+---
+
+## ADR-020: Graceful shutdown
+
+**Decision.** On SIGTERM the worker:
+1. stops claiming (claim loops exit),
+2. lets in-flight provider calls finish, for up to `SHUTDOWN_TIMEOUT` (15s),
+3. then cancels the rest. A cancelled call is recorded as a retryable attempt
+   (it may have reached the provider), not silently dropped,
+4. releases any job whose send had not started (attempt refunded),
+5. keeps the admin/health server up until the drain finishes.
+
+Provider calls run on a context derived with `context.WithoutCancel`, so the
+signal itself doesn't abort a call that is about to succeed. Result writes use
+a fresh 5s context, so a result is recorded even during a hard stop.
+`SHUTDOWN_TIMEOUT > PROVIDER_TIMEOUT` is enforced so a normal call always
+fits, and compose's `stop_grace_period` (20s) exceeds `SHUTDOWN_TIMEOUT`.
+Verified manually: SIGTERM with 8 sends in flight → all 8 recorded `sent`
+before exit.

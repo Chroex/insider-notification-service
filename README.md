@@ -53,3 +53,8 @@ Validation limits are configurable through environment variables:
   take a batch-level key; individual items in a batch do not.
 - A notification in `processing` cannot be cancelled: it may already be at the
   provider.
+- Any 2xx from the provider counts as accepted (the brief says 202;
+  webhook.site defaults to 200). `messageId` is stored when present.
+- Delivery is **at-least-once**: a worker crash between the provider's answer
+  and our database commit can resend a message. Every request carries
+  `X-Notification-ID` so a real provider can deduplicate it.
