@@ -24,6 +24,7 @@ func NewRouter(svc *notification.Service, log *slog.Logger, checks ...health.Che
 	mux.HandleFunc("GET /api/v1/notifications", h.listNotifications)
 	mux.HandleFunc("GET /api/v1/notifications/{id}", h.getNotification)
 	mux.HandleFunc("POST /api/v1/notifications/{id}/cancel", h.cancelNotification)
+	mux.HandleFunc("POST /api/v1/notifications/{id}/retry", h.retryNotification)
 	mux.HandleFunc("GET /api/v1/batches/{id}", h.getBatch)
 
 	// "/" matches anything not matched above: JSON 404 instead of text/plain.

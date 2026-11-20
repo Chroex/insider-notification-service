@@ -24,6 +24,7 @@ type Store interface {
 	ListAttempts(ctx context.Context, id uuid.UUID) ([]domain.DeliveryAttempt, error)
 	ListNotifications(ctx context.Context, f store.ListFilter) ([]domain.Notification, *store.Cursor, error)
 	CancelNotification(ctx context.Context, id uuid.UUID) (domain.Notification, error)
+	RetryNotification(ctx context.Context, id uuid.UUID, extraAttempts int) (domain.Notification, error)
 	InsertBatch(ctx context.Context, b domain.Batch, items []domain.Notification) (domain.Batch, bool, error)
 	GetBatchSummary(ctx context.Context, id uuid.UUID) (domain.BatchSummary, error)
 	ListBatchItems(ctx context.Context, batchID uuid.UUID, limit int, after *store.Cursor) ([]domain.Notification, *store.Cursor, error)
@@ -213,6 +214,13 @@ func (s *Service) List(ctx context.Context, f store.ListFilter) ([]domain.Notifi
 // Cancel cancels a scheduled, pending or retrying notification.
 func (s *Service) Cancel(ctx context.Context, id uuid.UUID) (domain.Notification, error) {
 	return s.store.CancelNotification(ctx, id)
+}
+
+// Retry re-queues a failed notification with a fresh attempt budget.
+// Failed notifications are the dead-letter set; this is the manual
+// "redrive" for them once the cause (bad config, provider outage) is fixed.
+func (s *Service) Retry(ctx context.Context, id uuid.UUID) (domain.Notification, error) {
+	return s.store.RetryNotification(ctx, id, s.cfg.MaxAttempts)
 }
 
 // GetBatch returns a batch summary and one page of its items.

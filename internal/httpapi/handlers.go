@@ -118,6 +118,20 @@ func (h *handlers) cancelNotification(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, toNotificationResponse(n))
 }
 
+// POST /api/v1/notifications/{id}/retry
+func (h *handlers) retryNotification(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r)
+	if !ok {
+		return
+	}
+	n, err := h.svc.Retry(r.Context(), id)
+	if err != nil {
+		writeServiceError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, toNotificationResponse(n))
+}
+
 // GET /api/v1/notifications?status=&channel=&from=&to=&limit=&cursor=
 func (h *handlers) listNotifications(w http.ResponseWriter, r *http.Request) {
 	filter, fieldErrs := parseListFilter(r.URL.Query())

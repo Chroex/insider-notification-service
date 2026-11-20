@@ -227,3 +227,30 @@ func (s *Store) CancelNotification(ctx context.Context, id uuid.UUID) (domain.No
 	}
 	return domain.Notification{}, &domain.InvalidTransitionError{From: current.Status, Action: "cancel"}
 }
+
+// RetryNotification re-queues a failed notification (the dead-letter set)
+// with a fresh budget of extraAttempts.
+//
+// attempts is NOT reset: delivery_attempts has a unique (notification_id,
+// attempt_no), and attempt numbers double as fencing tokens, so they must
+// keep increasing. Raising max_attempts gives the same "fresh budget"
+// without rewriting history.
+func (s *Store) RetryNotification(ctx context.Context, id uuid.UUID, extraAttempts int) (domain.Notification, error) {
+	n, err := ScanNotification(s.pool.QueryRow(ctx, `
+		UPDATE notifications
+		SET status = 'pending', max_attempts = attempts + $2,
+		    next_attempt_at = now(), locked_until = NULL
+		WHERE id = $1 AND status = 'failed'
+		RETURNING `+NotificationColumns, id, extraAttempts))
+	if err == nil {
+		return n, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return domain.Notification{}, fmt.Errorf("retry notification: %w", err)
+	}
+	current, err := s.GetNotification(ctx, id)
+	if err != nil {
+		return domain.Notification{}, err
+	}
+	return domain.Notification{}, &domain.InvalidTransitionError{From: current.Status, Action: "retry"}
+}

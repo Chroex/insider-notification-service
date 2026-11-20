@@ -570,3 +570,48 @@ func TestCancel_RacesWithWorkerClaim(t *testing.T) {
 		}
 	}
 }
+
+// --- manual retry ---
+
+func TestRetry_RequeuesFailedWithFreshBudget(t *testing.T) {
+	db.Reset(t)
+	id := call(t, "POST", "/api/v1/notifications", sms("hi")).Body["id"].(string)
+	// Simulate the worker exhausting 5 attempts.
+	if _, err := db.Pool.Exec(context.Background(), `UPDATE notifications
+		SET status = 'failed', attempts = 5, last_error = 'giving up after 5 attempts' WHERE id = $1`, id); err != nil {
+		t.Fatal(err)
+	}
+
+	r := call(t, "POST", "/api/v1/notifications/"+id+"/retry", nil)
+	expectStatus(t, r, http.StatusOK)
+	// attempts keeps counting (history and fencing); the budget moves up.
+	if r.Body["status"] != "pending" || r.Body["attempts"] != 5.0 || r.Body["max_attempts"] != 10.0 {
+		t.Errorf("after retry: %v", r.Body)
+	}
+	if r.Body["next_attempt_at"] == nil {
+		t.Error("a re-queued notification should expose next_attempt_at")
+	}
+
+	again := call(t, "POST", "/api/v1/notifications/"+id+"/retry", nil)
+	expectStatus(t, again, http.StatusConflict)
+	if errorCode(again) != "invalid_state" {
+		t.Errorf("code = %q", errorCode(again))
+	}
+}
+
+func TestRetry_OnlyFromFailed(t *testing.T) {
+	db.Reset(t)
+	for _, status := range []string{"pending", "processing", "sent", "cancelled"} {
+		id := call(t, "POST", "/api/v1/notifications", sms(status)).Body["id"].(string)
+		if _, err := db.Pool.Exec(context.Background(),
+			"UPDATE notifications SET status = $1 WHERE id = $2", status, id); err != nil {
+			t.Fatal(err)
+		}
+		r := call(t, "POST", "/api/v1/notifications/"+id+"/retry", nil)
+		if r.Status != http.StatusConflict {
+			t.Errorf("retry from %s: status %d, want 409", status, r.Status)
+		}
+	}
+	r := call(t, "POST", "/api/v1/notifications/0190a8c4-0000-7000-8000-000000000000/retry", nil)
+	expectStatus(t, r, http.StatusNotFound)
+}
