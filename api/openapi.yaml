@@ -1,0 +1,21 @@
+openapi: 3.0.3
+info:
+  title: Notification Service API
+  version: 0.1.0
+  description: Event-driven notification service (SMS, Email, Push). Full spec is written in a later phase.
+servers:
+  - url: http://localhost:8080
+paths:
+  /health/live:
+    get:
+      summary: Liveness probe (process is up)
+      tags: [health]
+      responses:
+        "200": { description: Process is running }
+  /health/ready:
+    get:
+      summary: Readiness probe (Postgres and Redis reachable)
+      tags: [health]
+      responses:
+        "200": { description: Ready }
+        "503": { description: A dependency is unreachable }

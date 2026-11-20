@@ -1,0 +1,95 @@
+name: notifications
+
+x-app-env: &app-env
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  DATABASE_URL: postgres://notifications:notifications@postgres:5432/notifications?sslmode=disable
+  REDIS_URL: redis://redis:6379/0
+  PROVIDER_URL: ${PROVIDER_URL:-http://mockprovider:8090/send}
+
+x-app-depends: &app-depends
+  postgres:
+    condition: service_healthy
+  redis:
+    condition: service_healthy
+  migrate:
+    condition: service_completed_successfully
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: notifications
+      POSTGRES_PASSWORD: notifications
+      POSTGRES_DB: notifications
+    ports: ["5432:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U notifications -d notifications"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # One-shot: applies migrations/ then exits. api and worker start only after
+  # it succeeds, so they never see an old schema. golang-migrate takes an
+  # advisory lock, so running it concurrently would also be safe.
+  migrate:
+    image: migrate/migrate:v4.20.1
+    volumes: [./migrations:/migrations:ro]
+    command:
+      - -path=/migrations
+      - -database=postgres://notifications:notifications@postgres:5432/notifications?sslmode=disable
+      - up
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    build: .
+    command: ["/usr/local/bin/api"]
+    environment:
+      <<: *app-env
+      API_ADDR: :8080
+    ports: ["8080:8080"]
+    depends_on: *app-depends
+
+  worker:
+    build: .
+    command: ["/usr/local/bin/worker"]
+    environment:
+      <<: *app-env
+      WORKER_ADMIN_ADDR: :8082
+    ports: ["8082:8082"]
+    # Give in-flight provider calls time to finish before SIGKILL.
+    stop_grace_period: 20s
+    depends_on: *app-depends
+
+  mockprovider:
+    build: .
+    command: ["/usr/local/bin/mockprovider"]
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      MOCK_ADDR: :8090
+      MOCK_FAILURE_RATE: ${MOCK_FAILURE_RATE:-0.1}
+      MOCK_FAILURE_CODES: ${MOCK_FAILURE_CODES:-500,503,429}
+      MOCK_LATENCY_MIN: ${MOCK_LATENCY_MIN:-20ms}
+      MOCK_LATENCY_MAX: ${MOCK_LATENCY_MAX:-120ms}
+    ports: ["8090:8090"]
+
+  swagger-ui:
+    image: swaggerapi/swagger-ui:v5.33.3
+    environment:
+      SWAGGER_JSON: /spec/openapi.yaml
+    volumes: [./api:/spec:ro]
+    ports: ["8081:8080"]
+
+volumes:
+  pgdata:
