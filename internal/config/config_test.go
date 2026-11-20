@@ -37,14 +37,14 @@ func TestLoad_Defaults(t *testing.T) {
 func TestLoad_Overrides(t *testing.T) {
 	cfg, err := Load(lookupFrom(map[string]string{
 		"API_ADDR":         ":9999",
-		"SHUTDOWN_TIMEOUT": "3s",
+		"SHUTDOWN_TIMEOUT": "30s",
 		"LOG_LEVEL":        "debug",
 		"PROVIDER_URL":     "https://webhook.site/abc",
 	}))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.APIAddr != ":9999" || cfg.ShutdownTimeout != 3*time.Second ||
+	if cfg.APIAddr != ":9999" || cfg.ShutdownTimeout != 30*time.Second ||
 		cfg.LogLevel != slog.LevelDebug || cfg.ProviderURL != "https://webhook.site/abc" {
 		t.Errorf("overrides not applied: %+v", cfg)
 	}
@@ -63,6 +63,30 @@ func TestLoad_ReportsAllErrorsAtOnce(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not mention %s", err, want)
 		}
+	}
+}
+
+func TestLoad_WorkerInvariants(t *testing.T) {
+	tests := []struct {
+		name    string
+		env     map[string]string
+		wantErr string
+	}{
+		{"lease shorter than two provider timeouts", map[string]string{"LEASE_DURATION": "8s", "PROVIDER_TIMEOUT": "5s"}, "LEASE_DURATION"},
+		{"shutdown not longer than provider timeout", map[string]string{"SHUTDOWN_TIMEOUT": "5s", "PROVIDER_TIMEOUT": "5s"}, "SHUTDOWN_TIMEOUT"},
+		{"zero concurrency", map[string]string{"WORKER_CONCURRENCY": "0"}, "WORKER_CONCURRENCY"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Load(lookupFrom(tt.env))
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("err = %v, want mention of %s", err, tt.wantErr)
+			}
+		})
+	}
+	cfg, err := Load(lookupFrom(nil))
+	if err != nil || cfg.Worker.LeaseDuration != 30*time.Second || cfg.Worker.Concurrency != 10 {
+		t.Errorf("worker defaults: %+v, %v", cfg.Worker, err)
 	}
 }
 

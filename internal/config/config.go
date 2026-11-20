@@ -37,6 +37,28 @@ type Config struct {
 	BatchMaxSize int
 	// MaxAttempts is the default delivery attempt budget per notification.
 	MaxAttempts int
+
+	Worker Worker
+}
+
+// Worker tunes the delivery engine.
+type Worker struct {
+	// Concurrency is the number of parallel provider calls per channel.
+	Concurrency int
+	// ClaimBatchSize caps rows claimed per query (bounded by free slots).
+	ClaimBatchSize int
+	// PollInterval is how long an idle channel waits before claiming again.
+	PollInterval time.Duration
+	// LeaseDuration is how long a claimed row stays owned by a worker. If the
+	// worker dies, the reaper re-queues the row after this. It must exceed
+	// the longest legitimate hold time (a provider call plus DB writes).
+	LeaseDuration time.Duration
+	// ReaperInterval is how often expired leases are returned to the queue.
+	ReaperInterval time.Duration
+	// ProviderTimeout bounds one provider HTTP call.
+	ProviderTimeout time.Duration
+	// RetryBaseDelay is the delay before retrying a retryable failure.
+	RetryBaseDelay time.Duration
 }
 
 // Load reads configuration using lookup (normally os.LookupEnv).
@@ -59,6 +81,15 @@ func Load(lookup LookupFunc) (Config, error) {
 		},
 		BatchMaxSize: r.int("BATCH_MAX_SIZE", 1000),
 		MaxAttempts:  r.int("MAX_ATTEMPTS", 5),
+		Worker: Worker{
+			Concurrency:     r.int("WORKER_CONCURRENCY", 10),
+			ClaimBatchSize:  r.int("CLAIM_BATCH_SIZE", 10),
+			PollInterval:    r.duration("POLL_INTERVAL", 500*time.Millisecond),
+			LeaseDuration:   r.duration("LEASE_DURATION", 30*time.Second),
+			ReaperInterval:  r.duration("REAPER_INTERVAL", 10*time.Second),
+			ProviderTimeout: r.duration("PROVIDER_TIMEOUT", 5*time.Second),
+			RetryBaseDelay:  r.duration("RETRY_BASE_DELAY", 2*time.Second),
+		},
 	}
 
 	level, err := parseLogLevel(r.string("LOG_LEVEL", "info"))
@@ -74,6 +105,17 @@ func Load(lookup LookupFunc) (Config, error) {
 		"*_MAX_CHARS limits must be positive")
 	r.require(cfg.BatchMaxSize > 0, "BATCH_MAX_SIZE must be positive")
 	r.require(cfg.MaxAttempts > 0, "MAX_ATTEMPTS must be positive")
+
+	w := cfg.Worker
+	r.require(w.Concurrency > 0 && w.ClaimBatchSize > 0, "WORKER_CONCURRENCY and CLAIM_BATCH_SIZE must be positive")
+	r.require(w.PollInterval > 0 && w.ReaperInterval > 0 && w.ProviderTimeout > 0 && w.RetryBaseDelay > 0,
+		"POLL_INTERVAL, REAPER_INTERVAL, PROVIDER_TIMEOUT and RETRY_BASE_DELAY must be positive")
+	// A lease shorter than a provider call would let the reaper hand a row
+	// to a second worker while the first is still sending it.
+	r.require(w.LeaseDuration >= 2*w.ProviderTimeout,
+		"LEASE_DURATION (%v) must be at least twice PROVIDER_TIMEOUT (%v)", w.LeaseDuration, w.ProviderTimeout)
+	r.require(cfg.ShutdownTimeout > w.ProviderTimeout,
+		"SHUTDOWN_TIMEOUT (%v) must exceed PROVIDER_TIMEOUT (%v) so in-flight sends can finish", cfg.ShutdownTimeout, w.ProviderTimeout)
 
 	if err := r.err(); err != nil {
 		return Config{}, fmt.Errorf("invalid configuration: %w", err)
