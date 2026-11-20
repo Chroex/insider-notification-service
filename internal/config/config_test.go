@@ -28,6 +28,10 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.LogLevel != slog.LevelInfo {
 		t.Errorf("LogLevel = %v, want info", cfg.LogLevel)
 	}
+	if cfg.Validation.SMSMaxChars != 160 || cfg.BatchMaxSize != 1000 || cfg.MaxAttempts != 5 {
+		t.Errorf("unexpected limit defaults: validation=%+v batch=%d attempts=%d",
+			cfg.Validation, cfg.BatchMaxSize, cfg.MaxAttempts)
+	}
 }
 
 func TestLoad_Overrides(t *testing.T) {

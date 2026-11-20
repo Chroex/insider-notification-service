@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"strings"
 	"time"
+
+	"notification-service/internal/validation"
 )
 
 // Config is shared by all binaries; each binary reads only the fields it needs.
@@ -28,6 +30,13 @@ type Config struct {
 	ShutdownTimeout time.Duration
 
 	ProviderURL string
+
+	// Validation holds per-channel content and recipient limits.
+	Validation validation.Rules
+	// BatchMaxSize caps items per POST /notifications/batch.
+	BatchMaxSize int
+	// MaxAttempts is the default delivery attempt budget per notification.
+	MaxAttempts int
 }
 
 // Load reads configuration using lookup (normally os.LookupEnv).
@@ -42,6 +51,14 @@ func Load(lookup LookupFunc) (Config, error) {
 		WorkerAdminAddr: r.string("WORKER_ADMIN_ADDR", ":8082"),
 		ShutdownTimeout: r.duration("SHUTDOWN_TIMEOUT", 15*time.Second),
 		ProviderURL:     r.string("PROVIDER_URL", "http://localhost:8090/send"),
+		Validation: validation.Rules{
+			SMSMaxChars:       r.int("SMS_MAX_CHARS", validation.DefaultRules.SMSMaxChars),
+			EmailMaxChars:     r.int("EMAIL_MAX_CHARS", validation.DefaultRules.EmailMaxChars),
+			PushMaxChars:      r.int("PUSH_MAX_CHARS", validation.DefaultRules.PushMaxChars),
+			PushTokenMaxChars: r.int("PUSH_TOKEN_MAX_CHARS", validation.DefaultRules.PushTokenMaxChars),
+		},
+		BatchMaxSize: r.int("BATCH_MAX_SIZE", 1000),
+		MaxAttempts:  r.int("MAX_ATTEMPTS", 5),
 	}
 
 	level, err := parseLogLevel(r.string("LOG_LEVEL", "info"))
@@ -52,6 +69,11 @@ func Load(lookup LookupFunc) (Config, error) {
 
 	r.require(cfg.DBMaxConns > 0, "DB_MAX_CONNS must be positive")
 	r.require(cfg.ShutdownTimeout > 0, "SHUTDOWN_TIMEOUT must be positive")
+	r.require(cfg.Validation.SMSMaxChars > 0 && cfg.Validation.EmailMaxChars > 0 &&
+		cfg.Validation.PushMaxChars > 0 && cfg.Validation.PushTokenMaxChars > 0,
+		"*_MAX_CHARS limits must be positive")
+	r.require(cfg.BatchMaxSize > 0, "BATCH_MAX_SIZE must be positive")
+	r.require(cfg.MaxAttempts > 0, "MAX_ATTEMPTS must be positive")
 
 	if err := r.err(); err != nil {
 		return Config{}, fmt.Errorf("invalid configuration: %w", err)
