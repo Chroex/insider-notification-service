@@ -32,6 +32,7 @@ Entries are added as the system is built; later entries may refine earlier ones.
 | [ADR-025](#adr-025-failed-notifications-are-the-dead-letter-set-manual-retry) | Failed notifications are the dead-letter set; manual retry |
 | [ADR-026](#adr-026-observability-metrics-summary-and-correlation) | Observability: metrics, summary and correlation |
 | [ADR-027](#adr-027-the-openapi-spec-is-a-tested-contract) | The OpenAPI spec is a tested contract |
+| [ADR-028](#adr-028-templates-are-immutable-and-rendered-at-create-time) | Templates are immutable and rendered at create time |
 
 ---
 
@@ -822,3 +823,44 @@ the two in sync but produces weaker docs and puts comments everywhere.
 Generating server code from the spec (oapi-codegen) is a strong option for a
 larger team; for this size a hand-written spec plus contract tests is simpler
 to read and explain.
+
+---
+
+## ADR-028: Templates are immutable and rendered at create time
+
+**Decision.**
+- `POST /api/v1/templates` stores a Go `text/template` body (`Hi
+  {{.first_name}}`). It is compiled on creation, so syntax errors fail
+  immediately rather than on the first send. The response lists the
+  **required variables**, found by walking the parse tree: every field read
+  from the root data, including in `{{if}}` branches and function arguments,
+  but not fields inside `{{range}}`/`{{with}}` bodies, where the dot is rebound
+  (unit-tested).
+- A notification gives either `content` or `template_id` + `variables`. The API
+  renders the template **at create time** and stores the result as `content`
+  (plus `template_id` and `variables` for traceability). Workers only ever see
+  final text.
+- The rendered text goes through the same channel rules as hand-written content.
+  An SMS template that renders to 171 characters is a 422 on `content`.
+  Missing variables are reported together ("missing required variables: code,
+  name"), not one per request; `missingkey=error` stays on as a safety net.
+- Templates are **immutable** (no update endpoint), so rendering at create
+  time is deterministic. The idempotency hash includes `template_id` and
+  `variables`.
+- A batch loads each distinct template once (`templateCache`), not once per
+  item.
+
+**Why render in the API rather than the worker.** Errors such as missing
+variables or rendered text that is too long reach the client synchronously as
+a 422, instead of failing later as a `failed` notification nobody is watching.
+The stored row shows exactly what was sent. And the worker stays a dumb,
+fast pipe.
+
+**Alternatives.** Rendering in the worker would allow late-bound data (e.g.
+current loyalty points), but turns client mistakes into asynchronous failures.
+Mutable templates would need versioning, so that queued notifications don't
+change meaning; that's future work if marketing teams need it.
+
+**Safety.** `text/template` has no loops without data and can't call functions
+unless they're registered, and the variables come from JSON (no functions). The
+template body is capped at 20,000 characters and the request body at 1 MiB.

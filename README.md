@@ -7,7 +7,7 @@ per-channel rate limits, prioritise urgent messages, retry failures with
 backoff, and stop calling a failing provider.
 
 - **Fast, safe intake:** validation, idempotency keys, batches of up to 1000
-  written in one transaction.
+  written in one transaction, and reusable message templates.
 - **Asynchronous delivery:** `SELECT ... FOR UPDATE SKIP LOCKED` work queue
   with leases, crash recovery and graceful shutdown.
 - **Provider protection:** a Redis token bucket (100 msg/s per channel, shared
@@ -289,6 +289,22 @@ curl -X POST localhost:8080/api/v1/notifications/batch -H 'Content-Type: applica
         {"channel":"push","recipient":"device-token-abc","content":"You left items in your cart"}]}'
 ```
 
+**Create a template and send from it** (`{{.var}}` placeholders, Go
+`text/template` syntax; missing variables and over-long rendered output are 422s):
+
+```bash
+curl -X POST localhost:8080/api/v1/templates -H 'Content-Type: application/json' \
+  -d '{"name":"order-shipped-sms","channel":"sms","body":"Hi {{.first_name}}, order {{.order_id}} has shipped."}'
+# -> {"id":"<template_id>", "variables":["first_name","order_id"], ...}
+
+curl -X POST localhost:8080/api/v1/notifications -H 'Content-Type: application/json' \
+  -d '{"channel":"sms","recipient":"+905551234567","template_id":"<template_id>",
+       "variables":{"first_name":"Ayşe","order_id":"TR-1042"}}'
+# -> "content": "Hi Ayşe, order TR-1042 has shipped."
+
+curl localhost:8080/api/v1/templates/<template_id>
+```
+
 **Get a notification with its attempt history:**
 
 ```bash
@@ -458,6 +474,7 @@ internal/
   worker/         dispatcher, retry policy, backoff, circuit breaker
   provider/       provider HTTP client
   ratelimit/      Redis token bucket (Lua scripts)
+  templating/     template compilation, variable discovery, rendering
   httpapi/        handlers, middleware, error mapping, CORS
   observability/  logging keys, Prometheus metrics, queue depth refresher
   health/         liveness and readiness
@@ -494,6 +511,8 @@ Validation limits are configurable through environment variables:
 - Rate limits are per channel and global across worker replicas. If Redis is
   down, sending pauses rather than running unthrottled.
 - Priority is strict (high, then normal, then low).
+- Templates are immutable (no update endpoint) and are rendered when the
+  notification is created; the stored `content` is the final text.
 - Delivery is **at-least-once**. Every request carries `X-Notification-ID` so
   a real provider can deduplicate.
 - There is no authentication; in production the API would sit behind an API
@@ -520,7 +539,6 @@ Validation limits are configurable through environment variables:
 - Multipart SMS with GSM-7/UCS-2 segment counting.
 - Per-tenant API keys, rate limits and idempotency scopes; expiring idempotency keys.
 - Bulk dead-letter redrive (`retry` by batch or error type).
-- Template rendering, WebSocket status stream, OpenTelemetry tracing (see the
-  bonus list in the brief).
+- Template versioning (new name or version per change) and per-locale variants.
 - Partitioning `notifications` by month and archiving old partitions.
 - `LISTEN/NOTIFY` to wake idle workers immediately.
