@@ -22,11 +22,15 @@ type Options struct {
 	// collectors is created.
 	Registry *prometheus.Registry
 	Checks   []health.Check
+	// CORSAllowedOrigins are browser origins allowed to call the API
+	// (e.g. Swagger UI). Empty disables CORS.
+	CORSAllowedOrigins []string
 }
 
 // NewRouter wires routes and middleware. Middleware order, outermost first:
-// correlation ID (so everything below can log it), access log, panic
-// recovery, and HTTP metrics innermost (see httpMetrics for why).
+// CORS (so preflights are answered before anything else), correlation ID
+// (so everything below can log it), access log, panic recovery, and HTTP
+// metrics innermost (see httpMetrics for why).
 func NewRouter(opts Options) http.Handler {
 	reg := opts.Registry
 	if reg == nil {
@@ -44,7 +48,7 @@ func NewRouter(opts Options) http.Handler {
 	// "/" matches anything not matched above: JSON 404 instead of text/plain.
 	mux.HandleFunc("/", notFound)
 
-	return chain(mux, correlationID(opts.Logger), requestLogger, recoverer, httpMetrics(metrics))
+	return chain(mux, cors(opts.CORSAllowedOrigins), correlationID(opts.Logger), requestLogger, recoverer, httpMetrics(metrics))
 }
 
 const metricsPattern = "GET /metrics"

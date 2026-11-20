@@ -57,9 +57,10 @@ func run() error {
 		MaxAttempts:  cfg.MaxAttempts,
 	})
 	router := httpapi.NewRouter(httpapi.Options{
-		Service:  svc,
-		Logger:   log,
-		Registry: observability.NewRegistry(),
+		Service:            svc,
+		Logger:             log,
+		Registry:           observability.NewRegistry(),
+		CORSAllowedOrigins: cfg.CORSAllowedOrigins,
 		Checks: []health.Check{
 			{Name: "postgres", Ping: db.Ping},
 			{Name: "redis", Ping: func(ctx context.Context) error { return rdb.Ping(ctx).Err() }},

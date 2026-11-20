@@ -22,8 +22,10 @@ type Config struct {
 	DBMaxConns int
 	RedisURL   string
 
-	APIAddr         string // HTTP API listen address
-	WorkerAdminAddr string // worker health/metrics listen address
+	APIAddr string // HTTP API listen address
+	// CORSAllowedOrigins are browser origins allowed to call the API.
+	CORSAllowedOrigins []string
+	WorkerAdminAddr    string // worker health/metrics listen address
 
 	// ShutdownTimeout bounds how long a binary waits for in-flight work
 	// (HTTP requests, provider calls) after SIGTERM.
@@ -89,13 +91,14 @@ func Load(lookup LookupFunc) (Config, error) {
 	r := &envReader{lookup: lookup}
 
 	cfg := Config{
-		DatabaseURL:     r.string("DATABASE_URL", "postgres://notifications:notifications@localhost:5432/notifications?sslmode=disable"),
-		DBMaxConns:      r.int("DB_MAX_CONNS", 10),
-		RedisURL:        r.string("REDIS_URL", "redis://localhost:6379/0"),
-		APIAddr:         r.string("API_ADDR", ":8080"),
-		WorkerAdminAddr: r.string("WORKER_ADMIN_ADDR", ":8082"),
-		ShutdownTimeout: r.duration("SHUTDOWN_TIMEOUT", 15*time.Second),
-		ProviderURL:     r.string("PROVIDER_URL", "http://localhost:8090/send"),
+		DatabaseURL:        r.string("DATABASE_URL", "postgres://notifications:notifications@localhost:5432/notifications?sslmode=disable"),
+		DBMaxConns:         r.int("DB_MAX_CONNS", 10),
+		RedisURL:           r.string("REDIS_URL", "redis://localhost:6379/0"),
+		APIAddr:            r.string("API_ADDR", ":8080"),
+		CORSAllowedOrigins: splitList(r.string("CORS_ALLOWED_ORIGINS", "http://localhost:8081")),
+		WorkerAdminAddr:    r.string("WORKER_ADMIN_ADDR", ":8082"),
+		ShutdownTimeout:    r.duration("SHUTDOWN_TIMEOUT", 15*time.Second),
+		ProviderURL:        r.string("PROVIDER_URL", "http://localhost:8090/send"),
 		Validation: validation.Rules{
 			SMSMaxChars:       r.int("SMS_MAX_CHARS", validation.DefaultRules.SMSMaxChars),
 			EmailMaxChars:     r.int("EMAIL_MAX_CHARS", validation.DefaultRules.EmailMaxChars),
@@ -175,4 +178,15 @@ func parseLogLevel(raw string) (slog.Level, error) {
 		return slog.LevelInfo, fmt.Errorf("LOG_LEVEL: %q must be one of debug, info, warn, error", raw)
 	}
 	return level, nil
+}
+
+// splitList parses "a, b,,c" into [a b c].
+func splitList(raw string) []string {
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
