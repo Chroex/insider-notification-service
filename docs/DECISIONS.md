@@ -477,3 +477,98 @@ a fresh 5s context, so a result is recorded even during a hard stop.
 fits, and compose's `stop_grace_period` (20s) exceeds `SHUTDOWN_TIMEOUT`.
 Verified manually: SIGTERM with 8 sends in flight → all 8 recorded `sent`
 before exit.
+
+---
+
+## ADR-021: Distributed rate limiting with a Redis token bucket (Lua)
+
+**Context.** Each channel's provider allows ~100 msg/s. The limit must hold
+across *all* worker replicas, not per process, and waiting workers must not
+spin.
+
+**Decision.** One token bucket per channel in Redis (`ratelimit:<channel>`,
+a hash of `tokens` and `ts`), updated by a Lua script that Redis runs
+atomically:
+1. Read the bucket, refill `elapsed x rate` tokens (capped at `burst`).
+2. Grant `min(requested, floor(tokens))`. A **partial grant** lets a worker
+   with 10 free slots still send 3 if only 3 tokens exist.
+3. If nothing was granted, return `wait_ms` = time until the next whole
+   token. The caller sleeps exactly that long, so a waiting worker costs
+   one Redis call per token rather than a busy loop. (Tested: 20 concurrent
+   waiters made 230 calls for 210 tokens.)
+4. `PEXPIRE` the key once an idle bucket would be full anyway.
+
+The script reads **Redis's clock** (`TIME`), not the caller's, so clock skew
+between worker hosts cannot inflate the rate.
+
+**Where it sits in the worker.** Tokens are acquired *before* claiming rows,
+and the claim asks for at most as many rows as tokens granted. Unused tokens
+(fewer rows were due) are refunded. If tokens were taken *after* claiming, a
+claimed row would wait for a token while its lease ticks down, and a backlog
+would pile up as `processing` rows that are not actually being processed.
+
+**Defaults.** 100 tokens/s per channel (`RATE_LIMIT_<CHANNEL>_PER_SECOND`),
+burst 10 (`RATE_LIMIT_BURST`). The burst is deliberately small. With
+burst = 100, a provider that counts fixed one-second windows could see up to
+~200 requests in one window right after an idle period and start returning
+429s. Burst 10 keeps any one-second window under ~110.
+
+**Measured.** 4 limiter instances x 5 goroutines over 2s: exactly 210 grants
+(100/s x 2s + burst 10). 2 full worker replicas against 500 queued SMS: 209
+provider calls in 2s.
+
+**Failure mode: fail closed.** If Redis is unreachable, the channel pauses
+(logged, retried every poll interval) instead of sending unthrottled. Getting
+throttled or banned by the provider is worse than a short pause, and the
+worker's `/health/ready` turns red so the outage is visible.
+
+**Alternatives.**
+- *Fixed window counter* (`INCR` + `EXPIRE`): simplest, but allows 2x the rate
+  across a window boundary.
+- *Sliding log* (sorted set of timestamps): exact, but memory grows with the
+  rate.
+- *GCRA / `redis-cell`*: elegant, but needs a Redis module.
+- *Per-process limiter (`x/time/rate`)*: needs `rate / replicas` per process
+  and breaks whenever replicas scale.
+
+Token bucket in Lua is exact enough, O(1) memory, and runs on plain Redis 7.
+
+**Trade-offs.** Each claim cycle costs 1-2 extra Redis round trips (acquire,
+maybe refund), negligible next to the provider call. An idle worker briefly
+holds tokens between acquire and refund; with burst 10 that can delay another
+replica by a few milliseconds.
+
+---
+
+## ADR-022: Strict priority ordering (and how to avoid starvation)
+
+**Decision.** The claim query orders by `priority_rank, next_attempt_at`:
+every due `high` notification on a channel goes before any `normal`, every
+`normal` before any `low`. Within a priority it is FIFO by due time. Rate
+limiting makes this matter: during a flash-sale burst the channel is capped at
+100/s, and strict priority decides *which* 100 go first (OTPs and
+transactional messages before marketing).
+
+**Evidence that it is cheap.** `EXPLAIN ANALYZE` on 205k rows (200k sent,
+5k pending): an index scan on the partial `notifications_claim_idx` with no
+Sort node (the index supplies the order), 0.05 ms. The index is 240 kB, against
+18 MB for the full list index, because it only holds the backlog (ADR-004).
+
+**Trade-off: starvation.** If `high` traffic alone saturates a channel's rate
+limit for a long time, `low` notifications are never claimed. For Insider
+One's mix (bursts, not sustained saturation) that is acceptable and is the
+behaviour product teams usually expect: marketing waits, OTPs don't.
+
+**Alternatives if starvation becomes real.**
+1. *Weighted fair claiming:* each claim cycle splits its tokens across
+   priorities by weight (e.g. 70/20/10) with one `priority_rank = $x` claim
+   per priority, giving unused share to the others. Keeps index-ordered
+   claims and guarantees `low` a minimum share.
+2. *Aging:* treat a row as one priority higher for every N minutes it has
+   waited. Easy to express in SQL, but the computed sort key can no longer be
+   served by the index, so every claim sorts the whole backlog.
+3. *Separate queues/topics per priority* in a Kafka design (ADR-001), with
+   consumer quotas per topic.
+
+Option 1 is the natural next step here: a small change in the claim loop and
+no schema change.

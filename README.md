@@ -55,6 +55,11 @@ Validation limits are configurable through environment variables:
   provider.
 - Any 2xx from the provider counts as accepted (the brief says 202;
   webhook.site defaults to 200). `messageId` is stored when present.
+- Rate limits are per channel and global across worker replicas (Redis token
+  bucket, 100/s by default, burst 10). If Redis is down, sending pauses
+  rather than running unthrottled.
+- Priority is strict (high, then normal, then low). Sustained high-priority
+  saturation can starve low priority; see ADR-022 for the weighted alternative.
 - Delivery is **at-least-once**: a worker crash between the provider's answer
   and our database commit can resend a message. Every request carries
   `X-Notification-ID` so a real provider can deduplicate it.
