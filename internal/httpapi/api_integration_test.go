@@ -17,6 +17,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/getkin/kin-openapi/openapi3"
+	"github.com/getkin/kin-openapi/openapi3filter"
+	"github.com/getkin/kin-openapi/routers"
+	legacyrouter "github.com/getkin/kin-openapi/routers/legacy"
+
 	"notification-service/internal/httpapi"
 	"notification-service/internal/notification"
 	"notification-service/internal/store"
@@ -27,6 +32,9 @@ import (
 var (
 	db     *testutil.Postgres
 	server *httptest.Server
+	// spec routes requests to api/openapi.yaml operations so every response
+	// in this suite is validated against the documented contract.
+	spec routers.Router
 )
 
 // TestMain starts one Postgres container for the whole package; each test
@@ -46,6 +54,10 @@ func TestMain(m *testing.M) {
 		Service: svc,
 		Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}))
+	if spec, err = loadSpecRouter(server.URL); err != nil {
+		fmt.Fprintln(os.Stderr, "load openapi spec:", err)
+		os.Exit(1)
+	}
 
 	code := m.Run()
 	server.Close()
@@ -88,11 +100,61 @@ func call(t *testing.T, method, path string, body any, headers ...string) respon
 		t.Fatal(err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	validateAgainstSpec(t, req, resp, raw)
+
 	out := response{Status: resp.StatusCode, Header: resp.Header, Body: map[string]any{}}
-	if err := json.NewDecoder(resp.Body).Decode(&out.Body); err != nil && err != io.EOF {
-		t.Fatalf("%s %s: decode body: %v", method, path, err)
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &out.Body); err != nil {
+			t.Fatalf("%s %s: decode body: %v", method, path, err)
+		}
 	}
 	return out
+}
+
+func loadSpecRouter(serverURL string) (routers.Router, error) {
+	doc, err := openapi3.NewLoader().LoadFromFile("../../api/openapi.yaml")
+	if err != nil {
+		return nil, err
+	}
+	doc.Servers = openapi3.Servers{{URL: serverURL}} // the test server, not localhost:8080
+	return legacyrouter.NewRouter(doc)
+}
+
+// validateAgainstSpec checks status code, headers and body of a response
+// against the operation documented in api/openapi.yaml. Undocumented status
+// codes fail too. Requests to unknown routes (the 404 catch-all) have no
+// operation to check against and are skipped; TestOpenAPISpecMatchesRoutes
+// guarantees every real route is documented.
+func validateAgainstSpec(t *testing.T, req *http.Request, resp *http.Response, body []byte) {
+	t.Helper()
+	route, params, err := spec.FindRoute(req)
+	if err != nil {
+		return
+	}
+	input := &openapi3filter.ResponseValidationInput{
+		RequestValidationInput: &openapi3filter.RequestValidationInput{
+			Request: req, PathParams: params, Route: route,
+		},
+		Status:  resp.StatusCode,
+		Header:  resp.Header,
+		Body:    io.NopCloser(bytes.NewReader(body)),
+		Options: &openapi3filter.Options{IncludeResponseStatus: true, MultiError: true},
+	}
+	if err := openapi3filter.ValidateResponse(context.Background(), input); err != nil {
+		t.Errorf("%s %s -> %d does not match api/openapi.yaml:\n%v\nbody: %s",
+			req.Method, req.URL.Path, resp.StatusCode, err, truncate(string(body), 500))
+	}
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }
 
 func expectStatus(t *testing.T, r response, want int) {
