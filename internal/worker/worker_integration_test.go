@@ -14,6 +14,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -63,7 +64,9 @@ type fakeProvider struct {
 	bodies  []map[string]string
 	started chan struct{} // receives once per request, before any delay
 	delay   time.Duration
-	respond func(id string, call int) int
+	// retryAfter, if set, is sent as Retry-After on 429/503 responses.
+	retryAfter string
+	respond    func(id string, call int) int
 }
 
 func newFakeProvider(t *testing.T, respond func(id string, call int) int) *fakeProvider {
@@ -90,6 +93,9 @@ func newFakeProvider(t *testing.T, respond func(id string, call int) int) *fakeP
 			}
 		}
 		status := fp.respond(id, call)
+		if fp.retryAfter != "" && (status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable) {
+			w.Header().Set("Retry-After", fp.retryAfter)
+		}
 		w.WriteHeader(status)
 		if status == http.StatusAccepted {
 			_, _ = fmt.Fprintf(w, `{"messageId":"msg-%s-%d","status":"accepted","timestamp":"2026-01-01T00:00:00Z"}`, id, call)
@@ -161,6 +167,12 @@ func startWorker(t *testing.T, providerURL string, cfg worker.Config) (stop func
 
 func startWorkerWithLimiter(t *testing.T, providerURL string, cfg worker.Config, limiter worker.RateLimiter) (stop func()) {
 	t.Helper()
+	_, stop = startWorkerHandle(t, providerURL, cfg, limiter)
+	return stop
+}
+
+func startWorkerHandle(t *testing.T, providerURL string, cfg worker.Config, limiter worker.RateLimiter) (*worker.Worker, func()) {
+	t.Helper()
 	w := worker.New(queue.New(db.Pool), provider.NewClient(providerURL, 2*time.Second), limiter, cfg,
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 	ctx, cancel := context.WithCancel(context.Background())
@@ -170,14 +182,14 @@ func startWorkerWithLimiter(t *testing.T, providerURL string, cfg worker.Config,
 		w.Run(ctx)
 	}()
 	var once sync.Once
-	stop = func() {
+	stop := func() {
 		once.Do(func() {
 			cancel()
 			<-done
 		})
 	}
 	t.Cleanup(stop)
-	return stop
+	return w, stop
 }
 
 type notificationOpt func(*domain.Notification)
@@ -657,5 +669,109 @@ func TestPriority_HighIsSentBeforeOlderLow(t *testing.T) {
 	want := strings.Join([]string{high.ID.String(), normal.ID.String(), low.ID.String()}, ",")
 	if got != want {
 		t.Errorf("send order = %s\nwant         %s (high, normal, low)", got, want)
+	}
+}
+
+// --- retry policy and circuit breaker ---
+
+func TestRetryAfter_IsHonoured(t *testing.T) {
+	db.Reset(t)
+	fp := newFakeProvider(t, func(_ string, call int) int {
+		if call == 1 {
+			return http.StatusTooManyRequests
+		}
+		return http.StatusAccepted
+	})
+	fp.retryAfter = "2"
+	n := insertNotification(t, domain.ChannelSMS)
+	startWorker(t, fp.URL, testConfig()) // own backoff is 20ms; Retry-After must win
+
+	retrying := waitForStatus(t, n.ID, domain.StatusRetrying, 5*time.Second)
+	first := attempts(t, n.ID)[0]
+	if gap := retrying.NextAttemptAt.Sub(first.StartedAt); gap < 1900*time.Millisecond || gap > 3*time.Second {
+		t.Errorf("next attempt scheduled %v after the 429, want ~2s (Retry-After)", gap)
+	}
+	sent := waitForStatus(t, n.ID, domain.StatusSent, 5*time.Second)
+	if sent.SentAt.Sub(first.StartedAt) < 1900*time.Millisecond {
+		t.Errorf("resent after %v, before Retry-After elapsed", sent.SentAt.Sub(first.StartedAt))
+	}
+}
+
+func TestCircuitBreaker_StopsHammeringAndRecovers(t *testing.T) {
+	db.Reset(t)
+	var providerDown atomic.Bool
+	providerDown.Store(true)
+	fp := newFakeProvider(t, func(string, int) int {
+		if providerDown.Load() {
+			return http.StatusServiceUnavailable
+		}
+		return http.StatusAccepted
+	})
+	const total = 10
+	for range total {
+		insertNotification(t, domain.ChannelSMS, withMaxAttempts(10))
+	}
+
+	opened := make(chan struct{}, 10)
+	cfg := testConfig()
+	cfg.Concurrency, cfg.ClaimBatchSize = 1, 1 // sequential, so the count of calls is exact
+	cfg.BreakerThreshold, cfg.BreakerCooldown = 3, 700*time.Millisecond
+	cfg.OnBreakerChange = func(ch domain.Channel, _, to worker.BreakerState) {
+		if ch == domain.ChannelSMS && to == worker.BreakerOpen {
+			opened <- struct{}{}
+		}
+	}
+	w, _ := startWorkerHandle(t, fp.URL, cfg, worker.Unlimited{})
+
+	select {
+	case <-opened:
+	case <-time.After(5 * time.Second):
+		t.Fatal("breaker never opened")
+	}
+	callsAtOpen := fp.totalCalls()
+	if callsAtOpen != 3 {
+		t.Errorf("provider calls when breaker opened = %d, want exactly the threshold (3)", callsAtOpen)
+	}
+
+	// During the cooldown the provider gets no traffic, and queued
+	// notifications keep their attempt budget.
+	time.Sleep(400 * time.Millisecond)
+	if c := fp.totalCalls(); c != callsAtOpen {
+		t.Errorf("provider called %d more times while breaker open", c-callsAtOpen)
+	}
+	var untouched int
+	if err := db.Pool.QueryRow(context.Background(),
+		"SELECT count(*) FROM notifications WHERE status = 'pending' AND attempts = 0").Scan(&untouched); err != nil {
+		t.Fatal(err)
+	}
+	if untouched != total-3 {
+		t.Errorf("%d notifications untouched while open, want %d (no attempts burned)", untouched, total-3)
+	}
+	if s := w.BreakerState(domain.ChannelSMS); s != worker.BreakerOpen {
+		t.Errorf("state = %s, want open", s)
+	}
+
+	// Provider recovers; the half-open probe succeeds and everything drains.
+	providerDown.Store(false)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var sent int
+		if err := db.Pool.QueryRow(context.Background(),
+			"SELECT count(*) FROM notifications WHERE status = 'sent'").Scan(&sent); err != nil {
+			t.Fatal(err)
+		}
+		if sent == total {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d/%d sent after recovery", sent, total)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if s := w.BreakerState(domain.ChannelSMS); s != worker.BreakerClosed {
+		t.Errorf("state after recovery = %s, want closed", s)
+	}
+	if c := fp.totalCalls(); c != total+3 {
+		t.Errorf("total provider calls = %d, want %d (3 failures + 1 send each)", c, total+3)
 	}
 }
