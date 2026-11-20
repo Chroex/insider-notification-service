@@ -146,6 +146,9 @@ func testConfig() worker.Config {
 			Base: 20 * time.Millisecond, Factor: 1, Max: 20 * time.Millisecond,
 			Random: func() float64 { return 1 },
 		}},
+		// High threshold: most tests exercise retries, not the breaker.
+		BreakerThreshold: 1000,
+		BreakerCooldown:  time.Second,
 	}
 }
 

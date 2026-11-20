@@ -86,6 +86,8 @@ func run() error {
 				Factor: cfg.Worker.RetryFactor,
 				Max:    cfg.Worker.RetryMaxDelay,
 			}},
+			BreakerThreshold: cfg.Worker.BreakerThreshold,
+			BreakerCooldown:  cfg.Worker.BreakerCooldown,
 		},
 		log,
 	)

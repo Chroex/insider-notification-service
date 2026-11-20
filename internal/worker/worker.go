@@ -52,6 +52,13 @@ type Config struct {
 	ReaperInterval  time.Duration
 	ShutdownTimeout time.Duration
 	Policy          RetryPolicy
+
+	// Circuit breaker per channel (see Breaker).
+	BreakerThreshold int
+	BreakerCooldown  time.Duration
+	// OnBreakerChange, if set, is called on every breaker transition
+	// (used for metrics).
+	OnBreakerChange func(ch domain.Channel, from, to BreakerState)
 }
 
 // persistTimeout bounds the DB write after a send. It uses a context that is
@@ -60,16 +67,37 @@ type Config struct {
 const persistTimeout = 5 * time.Second
 
 type Worker struct {
-	queue   Queue
-	sender  Sender
-	limiter RateLimiter
-	cfg     Config
-	log     *slog.Logger
-	now     func() time.Time
+	queue    Queue
+	sender   Sender
+	limiter  RateLimiter
+	breakers map[domain.Channel]*Breaker
+	cfg      Config
+	log      *slog.Logger
+	now      func() time.Time
 }
 
 func New(q Queue, s Sender, limiter RateLimiter, cfg Config, log *slog.Logger) *Worker {
-	return &Worker{queue: q, sender: s, limiter: limiter, cfg: cfg, log: log, now: time.Now}
+	w := &Worker{queue: q, sender: s, limiter: limiter, cfg: cfg, log: log, now: time.Now,
+		breakers: make(map[domain.Channel]*Breaker, len(cfg.Channels))}
+	for _, ch := range cfg.Channels {
+		w.breakers[ch] = NewBreaker(cfg.BreakerThreshold, cfg.BreakerCooldown, func(from, to BreakerState) {
+			level := slog.LevelWarn
+			if to == BreakerClosed {
+				level = slog.LevelInfo
+			}
+			log.Log(context.Background(), level, "circuit breaker state changed",
+				observability.KeyChannel, ch, "from", from.String(), "to", to.String())
+			if cfg.OnBreakerChange != nil {
+				cfg.OnBreakerChange(ch, from, to)
+			}
+		})
+	}
+	return w
+}
+
+// BreakerState reports a channel's circuit breaker state.
+func (w *Worker) BreakerState(ch domain.Channel) BreakerState {
+	return w.breakers[ch].State()
 }
 
 // Run processes notifications until ctx is cancelled, then shuts down
@@ -118,6 +146,8 @@ func (w *Worker) Run(ctx context.Context) {
 }
 
 // claimLoop runs per channel. Each iteration:
+//  0. asks the channel's circuit breaker how many sends may start (none
+//     while open: rows stay queued and keep their attempt budget),
 //  1. waits for free send slots (local concurrency),
 //  2. takes that many rate-limit tokens (global, shared via Redis),
 //  3. claims at most that many rows, and refunds tokens it did not use.
@@ -128,15 +158,33 @@ func (w *Worker) Run(ctx context.Context) {
 func (w *Worker) claimLoop(ctx, sendCtx context.Context, ch domain.Channel, inflight *sync.WaitGroup) {
 	log := w.log.With(observability.KeyChannel, ch)
 	slots := make(chan struct{}, w.cfg.Concurrency)
+	breaker := w.breakers[ch]
 
 	for {
-		n, ok := acquireSlots(ctx, slots, w.cfg.ClaimBatchSize)
+		permits, wait := breaker.Permits()
+		if permits == 0 {
+			// Open (wait = rest of the cooldown) or a half-open probe is
+			// already in flight. Sleep rather than poll the database.
+			sleep(ctx, max(wait, w.cfg.PollInterval))
+			if ctx.Err() != nil {
+				return
+			}
+			continue
+		}
+		limit := w.cfg.ClaimBatchSize
+		if permits != breakerNoLimit {
+			limit = min(limit, permits)
+		}
+
+		n, ok := acquireSlots(ctx, slots, limit)
 		if !ok {
+			breaker.ReleaseProbe()
 			return // shutting down
 		}
 
 		tokens, err := w.limiter.Acquire(ctx, ch, n)
 		if err != nil {
+			breaker.ReleaseProbe()
 			releaseSlots(slots, n)
 			if ctx.Err() != nil {
 				return
@@ -154,6 +202,9 @@ func (w *Worker) claimLoop(ctx, sendCtx context.Context, ch domain.Channel, infl
 		unused := tokens - len(jobs)
 		releaseSlots(slots, unused)
 		w.refund(log, ch, unused)
+		if len(jobs) == 0 {
+			breaker.ReleaseProbe() // nothing due, so no probe was sent
+		}
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -192,7 +243,14 @@ func (w *Worker) process(stopCtx, sendCtx context.Context, job domain.Notificati
 	// Shutdown began before this job's send started: hand it back untouched
 	// (attempt refunded) instead of starting a call we may not finish.
 	if stopCtx.Err() != nil {
-		w.release(log, job)
+		w.release(log, job, "released unsent job on shutdown")
+		return
+	}
+	// The breaker opened between claim and send (another send on this
+	// channel tripped it): don't add load to a failing provider.
+	breaker := w.breakers[job.Channel]
+	if breaker.IsOpen() {
+		w.release(log, job, "released job: circuit breaker open")
 		return
 	}
 
@@ -207,6 +265,9 @@ func (w *Worker) process(stopCtx, sendCtx context.Context, job domain.Notificati
 	duration := w.now().Sub(start)
 
 	c := Classify(sendErr)
+	if sendCtx.Err() == nil { // a send aborted by our own shutdown says nothing about provider health
+		breaker.Record(c.Outcome)
+	}
 	decision := w.cfg.Policy.Decide(job.Attempts, job.MaxAttempts, c, w.now())
 	completion := buildCompletion(job, res, c, decision, start, duration)
 
@@ -240,14 +301,14 @@ func (w *Worker) refund(log *slog.Logger, ch domain.Channel, n int) {
 	}
 }
 
-func (w *Worker) release(log *slog.Logger, job domain.Notification) {
+func (w *Worker) release(log *slog.Logger, job domain.Notification, reason string) {
 	ctx, cancel := context.WithTimeout(context.Background(), persistTimeout)
 	defer cancel()
 	if _, err := w.queue.Release(ctx, []domain.Notification{job}); err != nil {
-		log.Error("failed to release job on shutdown; reaper will recover it", "error", err)
+		log.Error("failed to release job; reaper will recover it", "error", err)
 		return
 	}
-	log.Info("released unsent job on shutdown")
+	log.Info(reason)
 }
 
 // reaperLoop periodically re-queues rows whose lease expired.
