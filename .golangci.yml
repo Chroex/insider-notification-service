@@ -1,0 +1,23 @@
+version: "2"
+linters:
+  default: standard        # errcheck, govet, ineffassign, staticcheck, unused
+  enable:
+    - bodyclose            # unclosed HTTP response bodies leak connections
+    - errorlint            # wrapped-error comparisons must use errors.Is/As
+    - gosec                # common security mistakes
+    - misspell
+    - noctx                # HTTP requests must carry a context
+    - revive
+    - sqlclosecheck
+    - unconvert
+  settings:
+    revive:
+      rules:
+        - name: exported
+          disabled: true   # internal packages; doc comments where they add value
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters: [gosec, noctx]
+formatters:
+  enable: [gofmt, goimports]
