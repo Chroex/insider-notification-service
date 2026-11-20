@@ -69,8 +69,16 @@ type Worker struct {
 	ReaperInterval time.Duration
 	// ProviderTimeout bounds one provider HTTP call.
 	ProviderTimeout time.Duration
-	// RetryBaseDelay is the delay before retrying a retryable failure.
+	// Retry backoff: ceiling = min(RetryMaxDelay, RetryBaseDelay * RetryFactor^(n-1)),
+	// actual delay is uniform in [0, ceiling) (full jitter).
 	RetryBaseDelay time.Duration
+	RetryFactor    float64
+	RetryMaxDelay  time.Duration
+
+	// Circuit breaker: after BreakerThreshold consecutive retryable failures
+	// on a channel, stop sending on it for BreakerCooldown, then probe.
+	BreakerThreshold int
+	BreakerCooldown  time.Duration
 }
 
 // Load reads configuration using lookup (normally os.LookupEnv).
@@ -94,13 +102,17 @@ func Load(lookup LookupFunc) (Config, error) {
 		BatchMaxSize: r.int("BATCH_MAX_SIZE", 1000),
 		MaxAttempts:  r.int("MAX_ATTEMPTS", 5),
 		Worker: Worker{
-			Concurrency:     r.int("WORKER_CONCURRENCY", 10),
-			ClaimBatchSize:  r.int("CLAIM_BATCH_SIZE", 10),
-			PollInterval:    r.duration("POLL_INTERVAL", 500*time.Millisecond),
-			LeaseDuration:   r.duration("LEASE_DURATION", 30*time.Second),
-			ReaperInterval:  r.duration("REAPER_INTERVAL", 10*time.Second),
-			ProviderTimeout: r.duration("PROVIDER_TIMEOUT", 5*time.Second),
-			RetryBaseDelay:  r.duration("RETRY_BASE_DELAY", 2*time.Second),
+			Concurrency:      r.int("WORKER_CONCURRENCY", 10),
+			ClaimBatchSize:   r.int("CLAIM_BATCH_SIZE", 10),
+			PollInterval:     r.duration("POLL_INTERVAL", 500*time.Millisecond),
+			LeaseDuration:    r.duration("LEASE_DURATION", 30*time.Second),
+			ReaperInterval:   r.duration("REAPER_INTERVAL", 10*time.Second),
+			ProviderTimeout:  r.duration("PROVIDER_TIMEOUT", 5*time.Second),
+			RetryBaseDelay:   r.duration("RETRY_BASE_DELAY", 2*time.Second),
+			RetryFactor:      r.float("RETRY_BACKOFF_FACTOR", 2),
+			RetryMaxDelay:    r.duration("RETRY_MAX_DELAY", 5*time.Minute),
+			BreakerThreshold: r.int("BREAKER_FAILURE_THRESHOLD", 5),
+			BreakerCooldown:  r.duration("BREAKER_COOLDOWN", 30*time.Second),
 		},
 		RateLimit: RateLimit{
 			PerSecond: map[string]float64{
@@ -134,6 +146,10 @@ func Load(lookup LookupFunc) (Config, error) {
 	// to a second worker while the first is still sending it.
 	r.require(w.LeaseDuration >= 2*w.ProviderTimeout,
 		"LEASE_DURATION (%v) must be at least twice PROVIDER_TIMEOUT (%v)", w.LeaseDuration, w.ProviderTimeout)
+	r.require(w.RetryFactor >= 1, "RETRY_BACKOFF_FACTOR must be >= 1")
+	r.require(w.RetryMaxDelay >= w.RetryBaseDelay, "RETRY_MAX_DELAY must be >= RETRY_BASE_DELAY")
+	r.require(w.BreakerThreshold >= 1 && w.BreakerCooldown > 0,
+		"BREAKER_FAILURE_THRESHOLD must be >= 1 and BREAKER_COOLDOWN positive")
 	for ch, rate := range cfg.RateLimit.PerSecond {
 		r.require(rate > 0, "RATE_LIMIT_%s_PER_SECOND must be positive", strings.ToUpper(ch))
 	}
