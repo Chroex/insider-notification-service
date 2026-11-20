@@ -27,12 +27,14 @@ func New(pool *pgxpool.Pool) *Store {
 	return &Store{pool: pool}
 }
 
-const notificationColumns = `id, batch_id, idempotency_key, request_hash, correlation_id,
+// NotificationColumns and ScanNotification are exported so the queue
+// package reads rows with exactly the same column order.
+const NotificationColumns = `id, batch_id, idempotency_key, request_hash, correlation_id,
 	channel, priority, recipient, content, status, attempts, max_attempts,
 	next_attempt_at, scheduled_at, locked_until, last_error, provider_message_id,
 	created_at, updated_at, sent_at`
 
-func scanNotification(row pgx.Row) (domain.Notification, error) {
+func ScanNotification(row pgx.Row) (domain.Notification, error) {
 	var n domain.Notification
 	err := row.Scan(
 		&n.ID, &n.BatchID, &n.IdempotencyKey, &n.RequestHash, &n.CorrelationID,
@@ -47,7 +49,7 @@ func collectNotifications(rows pgx.Rows) ([]domain.Notification, error) {
 	defer rows.Close()
 	var out []domain.Notification
 	for rows.Next() {
-		n, err := scanNotification(rows)
+		n, err := ScanNotification(rows)
 		if err != nil {
 			return nil, err
 		}
@@ -70,12 +72,12 @@ func (s *Store) InsertNotification(ctx context.Context, n domain.Notification) (
 			next_attempt_at, scheduled_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		ON CONFLICT (idempotency_key) DO NOTHING
-		RETURNING `+notificationColumns,
+		RETURNING `+NotificationColumns,
 		n.ID, n.IdempotencyKey, n.RequestHash, n.CorrelationID,
 		n.Channel, n.Priority, n.Recipient, n.Content, n.Status, n.MaxAttempts,
 		n.NextAttemptAt, n.ScheduledAt,
 	)
-	created, err := scanNotification(row)
+	created, err := ScanNotification(row)
 	if err == nil {
 		return created, true, nil
 	}
@@ -83,8 +85,8 @@ func (s *Store) InsertNotification(ctx context.Context, n domain.Notification) (
 		return domain.Notification{}, false, fmt.Errorf("insert notification: %w", err)
 	}
 
-	existing, err := scanNotification(s.pool.QueryRow(ctx,
-		`SELECT `+notificationColumns+` FROM notifications WHERE idempotency_key = $1`, *n.IdempotencyKey))
+	existing, err := ScanNotification(s.pool.QueryRow(ctx,
+		`SELECT `+NotificationColumns+` FROM notifications WHERE idempotency_key = $1`, *n.IdempotencyKey))
 	if err != nil {
 		return domain.Notification{}, false, fmt.Errorf("load notification by idempotency key: %w", err)
 	}
@@ -93,8 +95,8 @@ func (s *Store) InsertNotification(ctx context.Context, n domain.Notification) (
 
 // GetNotification returns domain.ErrNotFound when id does not exist.
 func (s *Store) GetNotification(ctx context.Context, id uuid.UUID) (domain.Notification, error) {
-	n, err := scanNotification(s.pool.QueryRow(ctx,
-		`SELECT `+notificationColumns+` FROM notifications WHERE id = $1`, id))
+	n, err := ScanNotification(s.pool.QueryRow(ctx,
+		`SELECT `+NotificationColumns+` FROM notifications WHERE id = $1`, id))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.Notification{}, domain.ErrNotFound
 	}
@@ -168,7 +170,7 @@ func (s *Store) ListNotifications(ctx context.Context, f ListFilter) ([]domain.N
 		where = append(where, fmt.Sprintf("(created_at, id) < ($%d, $%d)", len(args)-1, len(args)))
 	}
 
-	query := `SELECT ` + notificationColumns + ` FROM notifications`
+	query := `SELECT ` + NotificationColumns + ` FROM notifications`
 	if len(where) > 0 {
 		query += ` WHERE ` + strings.Join(where, " AND ")
 	}
@@ -206,11 +208,11 @@ func pageOf(items []domain.Notification, limit int) ([]domain.Notification, *Cur
 // makes it atomic: if a worker claims the row first, this UPDATE matches zero
 // rows instead of cancelling a message that is already being sent.
 func (s *Store) CancelNotification(ctx context.Context, id uuid.UUID) (domain.Notification, error) {
-	n, err := scanNotification(s.pool.QueryRow(ctx, `
+	n, err := ScanNotification(s.pool.QueryRow(ctx, `
 		UPDATE notifications
 		SET status = 'cancelled', locked_until = NULL
 		WHERE id = $1 AND status IN ('scheduled', 'pending', 'retrying')
-		RETURNING `+notificationColumns, id))
+		RETURNING `+NotificationColumns, id))
 	if err == nil {
 		return n, nil
 	}

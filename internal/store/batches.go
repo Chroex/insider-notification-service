@@ -110,7 +110,7 @@ func (s *Store) GetBatchSummary(ctx context.Context, id uuid.UUID) (domain.Batch
 // within a process, so id order equals the order of items in the request.
 func (s *Store) ListBatchItems(ctx context.Context, batchID uuid.UUID, limit int, after *Cursor) ([]domain.Notification, *Cursor, error) {
 	args := []any{batchID, limit + 1}
-	query := `SELECT ` + notificationColumns + ` FROM notifications WHERE batch_id = $1`
+	query := `SELECT ` + NotificationColumns + ` FROM notifications WHERE batch_id = $1`
 	if after != nil {
 		args = append(args, after.CreatedAt, after.ID)
 		query += ` AND (created_at, id) > ($3, $4)`
