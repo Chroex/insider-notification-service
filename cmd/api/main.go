@@ -14,8 +14,11 @@ import (
 
 	"notification-service/internal/config"
 	"notification-service/internal/health"
+	"notification-service/internal/httpapi"
+	"notification-service/internal/notification"
 	"notification-service/internal/observability"
 	"notification-service/internal/platform"
+	"notification-service/internal/store"
 )
 
 func main() {
@@ -48,15 +51,19 @@ func run() error {
 	}
 	defer func() { _ = rdb.Close() }()
 
-	mux := http.NewServeMux()
-	health.Register(mux, 2*time.Second,
+	svc := notification.NewService(store.New(db), notification.Config{
+		Rules:        cfg.Validation,
+		BatchMaxSize: cfg.BatchMaxSize,
+		MaxAttempts:  cfg.MaxAttempts,
+	})
+	router := httpapi.NewRouter(svc, log,
 		health.Check{Name: "postgres", Ping: db.Ping},
 		health.Check{Name: "redis", Ping: func(ctx context.Context) error { return rdb.Ping(ctx).Err() }},
 	)
 
 	srv := &http.Server{
 		Addr:              cfg.APIAddr,
-		Handler:           mux,
+		Handler:           router,
 		ReadHeaderTimeout: 5 * time.Second, // guards against slowloris clients
 	}
 	if err := platform.RunHTTPServer(ctx, srv, cfg.ShutdownTimeout, log); err != nil {
