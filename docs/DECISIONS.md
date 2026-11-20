@@ -572,3 +572,113 @@ behaviour product teams usually expect: marketing waits, OTPs don't.
 
 Option 1 is the natural next step here: a small change in the claim loop and
 no schema change.
+
+---
+
+## ADR-023: Exponential backoff with full jitter, honouring Retry-After
+
+**Decision.** After the k-th failed attempt (retryable errors only):
+
+```
+ceiling(k) = min(RETRY_MAX_DELAY, RETRY_BASE_DELAY * RETRY_BACKOFF_FACTOR^(k-1))
+delay(k)   = uniform random in [0, ceiling(k))            # "full jitter"
+delay(k)   = max(delay(k), min(Retry-After, 1h))          # provider knows best
+```
+
+Defaults: base 2s, factor 2, cap 5m, `MAX_ATTEMPTS` 5. So the ceilings before
+attempts 2-5 are 2s, 4s, 8s, 16s. The worst case is about 30s of waiting
+(expected ~15s) before a notification is failed.
+
+**Why full jitter.** An outage fails thousands of messages at the same instant.
+With plain exponential backoff they all retry at +2s, +4s, +8s in synchronized
+waves, and each wave hits the recovering provider with the whole backlog.
+Drawing each delay uniformly from the whole window spreads the retries out.
+AWS's "Exponential Backoff and Jitter" analysis found full jitter does the
+least total work and clears the backlog fastest. The unit test checks both
+the bounds (`0 <= delay < ceiling`) and that 2400 draws really spread out.
+
+**Retry-After.** If a 429/503 carries `Retry-After` (seconds or HTTP-date), we
+wait at least that long; the provider knows its own capacity. It is bounded
+at 1 hour so a broken header can't park messages indefinitely.
+
+**Why the budget is short.** Backoff is for *transient* blips (one bad request,
+a brief spike). A real outage is the circuit breaker's job (ADR-024): it stops
+claiming entirely, so a 30-minute outage doesn't burn anyone's 5 attempts.
+Together they keep latency low for blips without dead-lettering everything
+during an outage.
+
+**Alternatives.** "Equal jitter" (half fixed, half random) guarantees a
+minimum wait but spreads load less. "Decorrelated jitter" is a good
+alternative with similar results. A fixed delay is easy to reason about, but
+it gives synchronized retry storms.
+
+---
+
+## ADR-024: Circuit breaker per channel
+
+**Decision.** Each worker keeps one breaker per channel:
+
+```
+closed    --(BREAKER_FAILURE_THRESHOLD consecutive retryable failures)--> open
+open      --(BREAKER_COOLDOWN elapsed)--> half_open
+half_open --(single probe succeeds)--> closed
+half_open --(probe fails)----------> open (cooldown restarts)
+```
+
+- **What counts:** only retryable failures (5xx, 429, timeouts, network). A
+  permanent 4xx means the provider is up and rejected *that* request, so it
+  resets the streak like a success. A send aborted by our own shutdown is not
+  counted.
+- **While open, nothing is claimed.** Notifications stay `pending`/`retrying`
+  with their attempt budget intact (tested: 7 of 10 untouched at
+  `attempts = 0`). A job already claimed when the breaker trips is released
+  before sending, with its attempt refunded. The claim loop sleeps for the
+  remaining cooldown instead of polling.
+- **Half-open allows exactly one probe** across the channel's claim loop. If no
+  row is due, the probe permit is returned, so the next iteration can try again.
+- Transitions are logged (warn on open, info on close) and exposed through a
+  hook that feeds the `circuit_breaker_state{channel}` metric.
+
+**Measured.** Integration test (threshold 3, sequential sends): exactly 3
+provider calls, then none during the cooldown, then 10/10 sent once the
+provider recovered. Live run (threshold 5, concurrency 10, mock 100% 503):
+14 calls before the breaker stopped traffic. Sends already in flight when it
+trips still complete, so the worst case per worker is
+`threshold + concurrency` calls.
+
+**Per process, not shared.** Each replica learns provider health on its own
+traffic. With R replicas, an outage costs up to R x (threshold + concurrency)
+calls before all of them open. That's a few dozen requests, which is acceptable.
+A breaker shared in Redis would open everywhere at once, but it adds a Redis
+dependency to every send decision, and a cross-replica race on the half-open
+probe. Worth it only at large replica counts.
+
+**Alternatives.** Failure-*rate* windows (e.g. open at >50% failures over 20
+calls, as Hystrix and resilience4j do) are more robust to interleaved
+successes, but harder to reason about and test. Consecutive failures are
+enough for a single upstream per channel.
+
+---
+
+## ADR-025: Failed notifications are the dead-letter set; manual retry
+
+**Decision.** `failed` (permanent error or budget exhausted) is terminal for
+the worker and acts as the dead-letter queue: queryable with
+`GET /notifications?status=failed`, with `last_error` and the full attempt
+history. `POST /notifications/{id}/retry` redrives one:
+
+```sql
+UPDATE notifications
+SET status = 'pending', max_attempts = attempts + <MAX_ATTEMPTS>,
+    next_attempt_at = now(), locked_until = NULL
+WHERE id = $1 AND status = 'failed'
+```
+
+**Why `max_attempts` grows instead of `attempts` resetting to 0.**
+`delivery_attempts` has `UNIQUE (notification_id, attempt_no)`, and the attempt
+number is the fencing token (ADR-018), so it must only ever increase. Raising
+the budget gives the same "fresh 5 attempts" without rewriting history.
+Anything not `failed` gets 409, the same conditional-UPDATE pattern as cancel.
+
+**Future work.** A bulk redrive (`POST /notifications/retry?batch_id=...` or by
+error type) for after a provider outage or a fixed configuration bug.

@@ -34,6 +34,29 @@ make lint        # go vet + golangci-lint
 
 Configuration is environment-only; see [.env.example](.env.example).
 
+## Retry policy
+
+| Outcome of a provider call | Classified as | What happens |
+|---|---|---|
+| 2xx | success | `sent`, `provider_message_id` stored |
+| 4xx except 408/429 | permanent | `failed` immediately, never retried |
+| 5xx, 408, 429, timeout, network error | retryable | `retrying` with backoff, until `MAX_ATTEMPTS` (5) |
+
+- **Backoff:** exponential with full jitter. After the k-th failure the delay is
+  uniform in `[0, min(5m, 2s x 2^(k-1)))`, so ceilings run 2s, 4s, 8s, 16s.
+  A `Retry-After` header wins when it asks for longer (capped at 1h).
+- **Per-attempt timeout:** 5s (`PROVIDER_TIMEOUT`).
+- **Exhaustion:** `failed` with `last_error`. Failed notifications are the
+  dead-letter set; `POST /api/v1/notifications/{id}/retry` re-queues one with a
+  fresh budget.
+- **Circuit breaker (per channel):** 5 consecutive retryable failures open it.
+  For 30s nothing is claimed on that channel (no attempts are burned), then
+  one probe decides whether to close it again.
+- **Every attempt** is recorded in `delivery_attempts` (status code, error,
+  duration, outcome) and shown by `GET /api/v1/notifications/{id}`.
+
+See [docs/DECISIONS.md](docs/DECISIONS.md) ADR-019, ADR-023 to ADR-025 for the reasoning.
+
 ## Assumptions (so far)
 
 Validation limits are configurable through environment variables:
