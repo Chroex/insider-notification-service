@@ -34,6 +34,7 @@ Entries are added as the system is built; later entries may refine earlier ones.
 | [ADR-027](#adr-027-the-openapi-spec-is-a-tested-contract) | The OpenAPI spec is a tested contract |
 | [ADR-028](#adr-028-templates-are-immutable-and-rendered-at-create-time) | Templates are immutable and rendered at create time |
 | [ADR-029](#adr-029-live-status-stream-redis-pubsub-fanned-out-over-websocket) | Live status stream: Redis pub/sub fanned out over WebSocket |
+| [ADR-030](#adr-030-distributed-tracing-across-the-asynchronous-queue) | Distributed tracing across the asynchronous queue |
 
 ---
 
@@ -927,3 +928,48 @@ and graceful close.
 - *Server-Sent Events* would be simpler than WebSockets for one-way traffic;
   WebSocket was asked for and leaves room for client messages (e.g. changing
   the filter) later.
+
+---
+
+## ADR-030: Distributed tracing across the asynchronous queue
+
+**Context.** A notification's life spans two processes and an arbitrary wait:
+the API request, rows in Postgres, then one or more worker attempts and
+provider calls, possibly minutes later. Logs joined by `correlation_id` show
+*what* happened; a trace shows *where the time went*.
+
+**Decision.** OpenTelemetry with OTLP/HTTP export to Jaeger (compose,
+UI on :16686):
+- **Spans:** `otelhttp` on the API (server spans renamed to the route pattern;
+  health, metrics and `/ws` excluded), `otelpgx` on every query, `redisotel` on
+  Redis, a `deliver <channel>` consumer span per attempt in the worker, an
+  `otelhttp` transport on the provider client (which also sends `traceparent`),
+  and `otelhttp` on the mock provider.
+- **Crossing the queue:** the API stores the request's W3C `traceparent` in a
+  new `notifications.trace_parent` column (migration 000007; batches share the
+  batch request's). Each worker attempt starts its span as a **child** of that
+  stored context, so a single trace reads API → DB → attempt 1 → retry wait →
+  attempt 2 → provider. The OTel messaging convention also allows span
+  *links*; a parent/child relationship was chosen because it renders as one
+  readable timeline in Jaeger, which is what an on-call engineer needs.
+- **Sampling without noise:** `ParentBased(NoOrphanClientSpans)`. Spans with a
+  sampled parent are kept. Root spans are kept unless they are Client spans:
+  those are the worker's background chatter (claim polls every 500ms per
+  channel, rate-limiter calls, reaper and queue-depth queries), which would
+  otherwise each become a one-span trace. Measured: after ~90 claim polls the
+  worker had exactly one trace in Jaeger, rooted at the API request.
+- **Log correlation:** API and worker log lines carry `trace_id`.
+- **Off by default:** tracing is enabled only when the standard
+  `OTEL_EXPORTER_OTLP_ENDPOINT` is set, so tests and local runs pay nothing.
+
+**Tested.** Unit: sampler decisions and traceparent round trip. Integration:
+an incoming `traceparent` is stored on the row; a worker delivery span has the
+stored trace ID and parent span ID, and the provider receives a `traceparent`
+for the same trace. Live: one seeded batch produced a single trace with
+spans from `api`, `worker` and `mockprovider`.
+
+**Trade-offs.** Five extra modules (OTel SDK and exporter, otelhttp,
+otelpgx, redisotel). A trace stays open as long as a notification keeps retrying,
+so very long traces are possible (the retry budget caps them). At production
+volume we'd sample (head-based 1-5%, or tail-based in an OTel Collector so
+that every failed delivery is kept).

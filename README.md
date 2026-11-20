@@ -15,7 +15,8 @@ backoff, and stop calling a failing provider.
 - **Smart retries:** error classification, exponential backoff with full
   jitter, `Retry-After`, and a dead-letter set with manual redrive.
 - **Observability:** Prometheus metrics, a human-readable summary endpoint,
-  structured JSON logs, and correlation IDs from request to provider.
+  structured JSON logs, correlation IDs, a live WebSocket status stream, and
+  OpenTelemetry traces (Jaeger) from API request to provider call.
 
 Every significant choice is explained in [docs/DECISIONS.md](docs/DECISIONS.md).
 
@@ -55,12 +56,13 @@ make seed                        # send a demo batch: every channel and priority
 | Swagger UI    | http://localhost:8081                     | Interactive docs for [api/openapi.yaml](api/openapi.yaml) |
 | Worker admin  | http://localhost:8082                     | `/metrics`, `/health/live`, `/health/ready` |
 | Mock provider | http://localhost:8090/send                | Stand-in for webhook.site, with failure injection |
+| Jaeger        | http://localhost:16686                    | Distributed traces (service `api`, `worker`, `mockprovider`) |
 | Postgres      | `localhost:5432`                          | user / password / db: `notifications` |
 | Redis         | `localhost:6379`                          | Rate-limit buckets |
 
 `docker compose up` starts postgres and redis, runs the `migrate` one-shot
-container, and starts `api`, `worker`, `mockprovider` and `swagger-ui` once the
-schema is in place. `make down` stops everything and deletes the volumes.
+container, and starts `api`, `worker`, `mockprovider`, `swagger-ui` and
+`jaeger` once the schema is in place. `make down` stops everything and deletes the volumes.
 
 ---
 
@@ -245,6 +247,13 @@ Backoff handles brief blips; the breaker handles outages. Together they keep a
   notification, and sent to the provider.
 - **Health:** `/health/live` (process up, never checks dependencies) and
   `/health/ready` (Postgres and Redis reachable) on both API and worker.
+- **Tracing (OpenTelemetry → Jaeger):** one trace per request follows the
+  notification across the asynchronous queue: API handler → Postgres
+  statements → every worker delivery attempt (`deliver sms`, with retries) →
+  the provider HTTP call → the mock provider's own span. The API stores the
+  request's W3C `traceparent` on the row and the worker continues it. Log
+  lines carry `trace_id`. Enabled by `OTEL_EXPORTER_OTLP_ENDPOINT` (set in
+  compose); open http://localhost:16686 and search service `api`.
 - **Live status stream:** `ws://localhost:8080/ws?batch_id=<id>` (or
   `?notification_id=<id>`, or no filter) pushes a JSON event for every status
   change: created, processing, sent, retrying, failed, cancelled. Workers
@@ -404,6 +413,7 @@ problem listed in one error.
 | `RATE_LIMIT_PUSH_PER_SECOND` | `100` | worker | Push rate across all replicas |
 | `RATE_LIMIT_BURST` | `10` | worker | Token bucket capacity |
 | `QUEUE_DEPTH_INTERVAL` | `15s` | worker | Refresh period of the `queue_depth` gauge |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset (compose: `http://jaeger:4318`) | all | Enables tracing (OTLP/HTTP); other standard `OTEL_*` variables apply |
 | `MOCK_ADDR` | `:8090` | mockprovider | Listen address |
 | `MOCK_LATENCY_MIN` / `MOCK_LATENCY_MAX` | `20ms` / `120ms` | mockprovider | Simulated latency range |
 | `MOCK_FAILURE_RATE` | `0.1` | mockprovider | Probability (0-1) of an injected failure |
@@ -561,5 +571,7 @@ Validation limits are configurable through environment variables:
 - Per-tenant API keys, rate limits and idempotency scopes; expiring idempotency keys.
 - Bulk dead-letter redrive (`retry` by batch or error type).
 - Template versioning (new name or version per change) and per-locale variants.
+- Trace sampling for production volume (e.g. 1-5% head sampling, or tail
+  sampling in an OpenTelemetry Collector to keep every failed delivery).
 - Partitioning `notifications` by month and archiving old partitions.
 - `LISTEN/NOTIFY` to wake idle workers immediately.
