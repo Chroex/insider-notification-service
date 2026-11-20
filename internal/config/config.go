@@ -38,7 +38,19 @@ type Config struct {
 	// MaxAttempts is the default delivery attempt budget per notification.
 	MaxAttempts int
 
-	Worker Worker
+	Worker    Worker
+	RateLimit RateLimit
+}
+
+// RateLimit configures the per-channel token buckets shared by all worker
+// replicas through Redis.
+type RateLimit struct {
+	// PerSecond is the sustained rate per channel (tokens refilled per second).
+	PerSecond map[string]float64
+	// Burst is the bucket capacity: how many sends may go out back-to-back
+	// after an idle period. Kept well below PerSecond so a provider that
+	// counts per-second windows never sees more than ~PerSecond+Burst.
+	Burst int
 }
 
 // Worker tunes the delivery engine.
@@ -90,6 +102,14 @@ func Load(lookup LookupFunc) (Config, error) {
 			ProviderTimeout: r.duration("PROVIDER_TIMEOUT", 5*time.Second),
 			RetryBaseDelay:  r.duration("RETRY_BASE_DELAY", 2*time.Second),
 		},
+		RateLimit: RateLimit{
+			PerSecond: map[string]float64{
+				"sms":   r.float("RATE_LIMIT_SMS_PER_SECOND", 100),
+				"email": r.float("RATE_LIMIT_EMAIL_PER_SECOND", 100),
+				"push":  r.float("RATE_LIMIT_PUSH_PER_SECOND", 100),
+			},
+			Burst: r.int("RATE_LIMIT_BURST", 10),
+		},
 	}
 
 	level, err := parseLogLevel(r.string("LOG_LEVEL", "info"))
@@ -114,6 +134,10 @@ func Load(lookup LookupFunc) (Config, error) {
 	// to a second worker while the first is still sending it.
 	r.require(w.LeaseDuration >= 2*w.ProviderTimeout,
 		"LEASE_DURATION (%v) must be at least twice PROVIDER_TIMEOUT (%v)", w.LeaseDuration, w.ProviderTimeout)
+	for ch, rate := range cfg.RateLimit.PerSecond {
+		r.require(rate > 0, "RATE_LIMIT_%s_PER_SECOND must be positive", strings.ToUpper(ch))
+	}
+	r.require(cfg.RateLimit.Burst >= 1, "RATE_LIMIT_BURST must be at least 1")
 	r.require(cfg.ShutdownTimeout > w.ProviderTimeout,
 		"SHUTDOWN_TIMEOUT (%v) must exceed PROVIDER_TIMEOUT (%v) so in-flight sends can finish", cfg.ShutdownTimeout, w.ProviderTimeout)
 

@@ -90,6 +90,20 @@ func TestLoad_WorkerInvariants(t *testing.T) {
 	}
 }
 
+func TestLoad_RateLimit(t *testing.T) {
+	cfg, err := Load(lookupFrom(map[string]string{"RATE_LIMIT_SMS_PER_SECOND": "25.5"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RateLimit.PerSecond["sms"] != 25.5 || cfg.RateLimit.PerSecond["email"] != 100 || cfg.RateLimit.Burst != 10 {
+		t.Errorf("rate limit = %+v", cfg.RateLimit)
+	}
+	if _, err := Load(lookupFrom(map[string]string{"RATE_LIMIT_PUSH_PER_SECOND": "0"})); err == nil ||
+		!strings.Contains(err.Error(), "RATE_LIMIT_PUSH_PER_SECOND") {
+		t.Errorf("zero push rate err = %v", err)
+	}
+}
+
 func TestLoad_RejectsNonPositiveShutdownTimeout(t *testing.T) {
 	_, err := Load(lookupFrom(map[string]string{"SHUTDOWN_TIMEOUT": "0s"}))
 	if err == nil {
