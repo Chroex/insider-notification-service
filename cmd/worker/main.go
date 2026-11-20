@@ -81,7 +81,11 @@ func run() error {
 			LeaseDuration:   cfg.Worker.LeaseDuration,
 			ReaperInterval:  cfg.Worker.ReaperInterval,
 			ShutdownTimeout: cfg.ShutdownTimeout,
-			Policy:          worker.RetryPolicy{BaseDelay: cfg.Worker.RetryBaseDelay},
+			Policy: worker.RetryPolicy{Backoff: worker.Backoff{
+				Base:   cfg.Worker.RetryBaseDelay,
+				Factor: cfg.Worker.RetryFactor,
+				Max:    cfg.Worker.RetryMaxDelay,
+			}},
 		},
 		log,
 	)

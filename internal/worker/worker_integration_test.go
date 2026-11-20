@@ -141,7 +141,11 @@ func testConfig() worker.Config {
 		LeaseDuration:   10 * time.Second,
 		ReaperInterval:  time.Hour, // reaper is exercised directly in its own test
 		ShutdownTimeout: 2 * time.Second,
-		Policy:          worker.RetryPolicy{BaseDelay: 20 * time.Millisecond},
+		// Constant 20ms (Factor 1, Random 1) keeps retry tests fast and deterministic.
+		Policy: worker.RetryPolicy{Backoff: worker.Backoff{
+			Base: 20 * time.Millisecond, Factor: 1, Max: 20 * time.Millisecond,
+			Random: func() float64 { return 1 },
+		}},
 	}
 }
 
