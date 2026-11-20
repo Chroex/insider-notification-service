@@ -53,8 +53,7 @@ services:
         condition: service_healthy
 
   api:
-    build: .
-    command: ["/usr/local/bin/api"]
+    build: { context: ., target: api }
     environment:
       <<: *app-env
       API_ADDR: :8080
@@ -62,8 +61,7 @@ services:
     depends_on: *app-depends
 
   worker:
-    build: .
-    command: ["/usr/local/bin/worker"]
+    build: { context: ., target: worker }
     environment:
       <<: *app-env
       WORKER_ADMIN_ADDR: :8082
@@ -73,8 +71,7 @@ services:
     depends_on: *app-depends
 
   mockprovider:
-    build: .
-    command: ["/usr/local/bin/mockprovider"]
+    build: { context: ., target: mockprovider }
     environment:
       LOG_LEVEL: ${LOG_LEVEL:-info}
       MOCK_ADDR: :8090

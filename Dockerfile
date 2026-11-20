@@ -13,9 +13,23 @@ COPY . .
 # -trimpath and -s -w strip local paths and debug symbols for smaller images.
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/ ./cmd/...
 
-# ---- runtime stage: no shell, no package manager, non-root -----------------
-FROM gcr.io/distroless/static-debian12:nonroot
-COPY --from=build /out/ /usr/local/bin/
+# ---- runtime stages: one small image per binary ---------------------------
+# No shell, no package manager, non-root. Each image contains only its own
+# binary; the build stage above is shared, so Go compiles once.
+FROM gcr.io/distroless/static-debian12:nonroot AS runtime
 USER nonroot:nonroot
-# Each compose service picks its binary via `command`.
-ENTRYPOINT []
+
+FROM runtime AS api
+COPY --from=build /out/api /usr/local/bin/api
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/api"]
+
+FROM runtime AS worker
+COPY --from=build /out/worker /usr/local/bin/worker
+EXPOSE 8082
+ENTRYPOINT ["/usr/local/bin/worker"]
+
+FROM runtime AS mockprovider
+COPY --from=build /out/mockprovider /usr/local/bin/mockprovider
+EXPOSE 8090
+ENTRYPOINT ["/usr/local/bin/mockprovider"]
