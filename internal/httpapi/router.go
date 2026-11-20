@@ -37,19 +37,43 @@ func NewRouter(opts Options) http.Handler {
 	mux := http.NewServeMux()
 
 	health.Register(mux, 2*time.Second, opts.Checks...)
-	mux.Handle("GET /metrics", observability.MetricsHandler(reg))
-
-	mux.HandleFunc("POST /api/v1/notifications", h.createNotification)
-	mux.HandleFunc("POST /api/v1/notifications/batch", h.createBatch)
-	mux.HandleFunc("GET /api/v1/notifications", h.listNotifications)
-	mux.HandleFunc("GET /api/v1/notifications/{id}", h.getNotification)
-	mux.HandleFunc("POST /api/v1/notifications/{id}/cancel", h.cancelNotification)
-	mux.HandleFunc("POST /api/v1/notifications/{id}/retry", h.retryNotification)
-	mux.HandleFunc("GET /api/v1/batches/{id}", h.getBatch)
-	mux.HandleFunc("GET /api/v1/metrics/summary", h.metricsSummary)
-
+	mux.Handle(metricsPattern, observability.MetricsHandler(reg))
+	for _, rt := range h.routes() {
+		mux.HandleFunc(rt.pattern, rt.handler)
+	}
 	// "/" matches anything not matched above: JSON 404 instead of text/plain.
 	mux.HandleFunc("/", notFound)
 
 	return chain(mux, correlationID(opts.Logger), requestLogger, recoverer, httpMetrics(metrics))
+}
+
+const metricsPattern = "GET /metrics"
+
+type route struct {
+	pattern string
+	handler http.HandlerFunc
+}
+
+// routes is the single table of API endpoints. api/openapi.yaml must
+// document exactly these (enforced by TestOpenAPISpecMatchesRoutes).
+func (h *handlers) routes() []route {
+	return []route{
+		{"POST /api/v1/notifications", h.createNotification},
+		{"POST /api/v1/notifications/batch", h.createBatch},
+		{"GET /api/v1/notifications", h.listNotifications},
+		{"GET /api/v1/notifications/{id}", h.getNotification},
+		{"POST /api/v1/notifications/{id}/cancel", h.cancelNotification},
+		{"POST /api/v1/notifications/{id}/retry", h.retryNotification},
+		{"GET /api/v1/batches/{id}", h.getBatch},
+		{"GET /api/v1/metrics/summary", h.metricsSummary},
+	}
+}
+
+// RoutePatterns lists every "METHOD /path" the router serves.
+func RoutePatterns() []string {
+	patterns := []string{health.LivePattern, health.ReadyPattern, metricsPattern}
+	for _, rt := range (&handlers{}).routes() {
+		patterns = append(patterns, rt.pattern)
+	}
+	return patterns
 }

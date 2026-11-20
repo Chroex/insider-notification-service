@@ -26,12 +26,18 @@ type response struct {
 	Checks map[string]string `json:"checks,omitempty"`
 }
 
+// Route patterns registered by Register.
+const (
+	LivePattern  = "GET /health/live"
+	ReadyPattern = "GET /health/ready"
+)
+
 // Register mounts /health/live and /health/ready on mux.
 func Register(mux *http.ServeMux, timeout time.Duration, checks ...Check) {
-	mux.HandleFunc("GET /health/live", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc(LivePattern, func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, response{Status: "ok"})
 	})
-	mux.HandleFunc("GET /health/ready", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(ReadyPattern, func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), timeout)
 		defer cancel()
 
