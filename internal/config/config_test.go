@@ -69,3 +69,32 @@ func TestLoad_RejectsNonPositiveShutdownTimeout(t *testing.T) {
 	}
 }
 
+func TestLoadMockProvider(t *testing.T) {
+	tests := []struct {
+		name    string
+		env     map[string]string
+		wantErr string
+	}{
+		{name: "defaults", env: nil},
+		{name: "bad failure rate", env: map[string]string{"MOCK_FAILURE_RATE": "1.5"}, wantErr: "MOCK_FAILURE_RATE"},
+		{name: "bad status code", env: map[string]string{"MOCK_FAILURE_CODES": "500,200"}, wantErr: "MOCK_FAILURE_CODES"},
+		{name: "min above max", env: map[string]string{"MOCK_LATENCY_MIN": "2s", "MOCK_LATENCY_MAX": "1s"}, wantErr: "MOCK_LATENCY"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := LoadMockProvider(lookupFrom(tt.env))
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if len(cfg.FailureCodes) != 3 || cfg.Addr != ":8090" {
+					t.Errorf("unexpected defaults: %+v", cfg)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("error = %v, want mention of %s", err, tt.wantErr)
+			}
+		})
+	}
+}
