@@ -11,6 +11,7 @@ import (
 
 	"notification-service/internal/domain"
 	"notification-service/internal/templating"
+	"notification-service/internal/validation"
 )
 
 // TemplateInput is a create-template request.
@@ -41,8 +42,11 @@ func (s *Service) CreateTemplate(ctx context.Context, in TemplateInput) (Templat
 		errs = append(errs, domain.FieldError{Field: "channel", Message: "must be one of sms, email, push"})
 	}
 	compiled, err := templating.Compile(in.Body)
-	if err != nil {
+	switch {
+	case err != nil:
 		errs = append(errs, domain.FieldError{Field: "body", Message: err.Error()})
+	case strings.ContainsRune(in.Body, 0):
+		errs = append(errs, domain.FieldError{Field: "body", Message: "must not contain the NUL character (U+0000)"})
 	}
 	if len(errs) > 0 {
 		return TemplateView{}, &domain.ValidationError{Fields: errs}
@@ -94,6 +98,9 @@ func (s *Service) applyTemplate(ctx context.Context, in *CreateInput, cache temp
 	}
 	if in.Content != "" {
 		return fieldErr("content", "must be empty when template_id is given (content is rendered from the template)"), nil
+	}
+	if validation.ContainsNUL(in.Variables) {
+		return fieldErr("variables", "must not contain the NUL character (U+0000)"), nil
 	}
 
 	cached, ok := cache[*in.TemplateID]

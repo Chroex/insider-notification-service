@@ -531,6 +531,9 @@ Validation limits are configurable through environment variables:
 - Lengths count Unicode characters, not bytes. Real SMS encoding (GSM-7 160 vs
   UCS-2 70 characters per segment, multipart SMS) is future work.
 - `priority` defaults to `normal`. `scheduled_at` must be in the future.
+- Text fields, template bodies and template variables must not contain the
+  NUL character (U+0000). Postgres `text` and `jsonb` cannot store it, so it is
+  rejected with a 422 instead of failing at insert time.
 - A batch is all-or-nothing: one invalid item rejects the whole batch with a 422
   listing every failing index.
 - Idempotency keys are global (no multi-tenancy) and do not expire. Batches

@@ -257,6 +257,12 @@ func TestCreate_Rejections(t *testing.T) {
 		{"two objects", `{"channel":"sms"}{"channel":"sms"}`, http.StatusBadRequest, "invalid_json"},
 		{"past schedule", map[string]any{"channel": "sms", "recipient": "+905551234567", "content": "x",
 			"scheduled_at": "2001-01-01T00:00:00Z"}, http.StatusUnprocessableEntity, "validation_failed"},
+		// Postgres cannot store U+0000; before validation caught it, the
+		// INSERT failed and the client got a 500.
+		{"NUL in content", `{"channel":"sms","recipient":"+905551234567","content":"a\u0000b"}`,
+			http.StatusUnprocessableEntity, "validation_failed"},
+		{"NUL in push token", `{"channel":"push","recipient":"tok\u0000en","content":"hi"}`,
+			http.StatusUnprocessableEntity, "validation_failed"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -881,6 +887,8 @@ func TestTemplates_CreateAndGet(t *testing.T) {
 	if n := len(bad.Body["error"].(map[string]any)["details"].([]any)); n != 3 {
 		t.Errorf("want name, channel and body errors, got %d: %v", n, bad.Body)
 	}
+	nul := call(t, "POST", "/api/v1/templates", map[string]any{"name": "nul", "channel": "sms", "body": "Hi\x00"})
+	expectStatus(t, nul, http.StatusUnprocessableEntity)
 
 	expectStatus(t, call(t, "GET", "/api/v1/templates/0190a8c4-0000-7000-8000-000000000000", nil), http.StatusNotFound)
 }
@@ -927,6 +935,8 @@ func TestTemplates_Rejections(t *testing.T) {
 			"content": "hi", "variables": map[string]any{"a": 1}}, "variables"},
 		{"rendered output too long for sms", map[string]any{"channel": "sms", "recipient": "+905551234567",
 			"template_id": longTpl, "variables": map[string]any{"text": strings.Repeat("x", 150)}}, "content"},
+		{"NUL in an unused variable", map[string]any{"channel": "sms", "recipient": "+905551234567",
+			"template_id": smsTpl, "variables": map[string]any{"code": 1, "name": "x", "extra": "\x00"}}, "variables"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

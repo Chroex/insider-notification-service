@@ -63,6 +63,14 @@ func (r Rules) Validate(req Request, now time.Time) []domain.FieldError {
 	if strings.TrimSpace(req.Content) == "" {
 		add("content", "is required")
 	}
+	// Postgres text and jsonb cannot store U+0000, so without these checks a
+	// NUL character would pass validation and fail at INSERT time as a 500.
+	if strings.ContainsRune(req.Content, 0) {
+		add("content", "must not contain the NUL character (U+0000)")
+	}
+	if strings.ContainsRune(req.Recipient, 0) {
+		add("recipient", "must not contain the NUL character (U+0000)")
+	}
 
 	channel := domain.Channel(req.Channel)
 	if !channel.Valid() {
@@ -117,4 +125,26 @@ func validEmail(s string) bool {
 	}
 	at := strings.LastIndexByte(s, '@')
 	return strings.Contains(s[at+1:], ".")
+}
+
+// ContainsNUL reports whether a decoded JSON value (strings, object keys,
+// nested arrays and objects) contains U+0000, which Postgres jsonb rejects.
+func ContainsNUL(v any) bool {
+	switch v := v.(type) {
+	case string:
+		return strings.ContainsRune(v, 0)
+	case map[string]any:
+		for k, item := range v {
+			if strings.ContainsRune(k, 0) || ContainsNUL(item) {
+				return true
+			}
+		}
+	case []any:
+		for _, item := range v {
+			if ContainsNUL(item) {
+				return true
+			}
+		}
+	}
+	return false
 }

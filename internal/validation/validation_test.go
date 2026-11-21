@@ -60,6 +60,8 @@ func TestValidate(t *testing.T) {
 		{"scheduled in future ok", Request{Channel: "sms", Recipient: "+905551234567", Content: "hi", ScheduledAt: ptr(now.Add(time.Minute))}, nil},
 		{"scheduled in past", Request{Channel: "sms", Recipient: "+905551234567", Content: "hi", ScheduledAt: ptr(now.Add(-time.Minute))}, []string{"scheduled_at"}},
 		{"scheduled exactly now", Request{Channel: "sms", Recipient: "+905551234567", Content: "hi", ScheduledAt: ptr(now)}, []string{"scheduled_at"}},
+		{"NUL in content", Request{Channel: "sms", Recipient: "+905551234567", Content: "a\x00b"}, []string{"content"}},
+		{"NUL in push token", Request{Channel: "push", Recipient: "tok\x00en", Content: "hi"}, []string{"recipient"}},
 		{"reports all errors at once", Request{Channel: "sms", Recipient: "bad", Content: "", Priority: "x"}, []string{"priority", "content", "recipient"}},
 	}
 	for _, tt := range tests {
@@ -78,5 +80,26 @@ func TestValidate_LimitsAreConfigurable(t *testing.T) {
 	errs := rules.Validate(Request{Channel: "sms", Recipient: "+905551234567", Content: strings.Repeat("a", 11)}, now)
 	if len(errs) != 1 || !strings.Contains(errs[0].Message, "at most 10") {
 		t.Errorf("errs = %+v, want one content error mentioning the configured limit", errs)
+	}
+}
+
+func TestContainsNUL(t *testing.T) {
+	tests := []struct {
+		name string
+		v    any
+		want bool
+	}{
+		{"nil", nil, false},
+		{"clean object", map[string]any{"name": "Ayşe", "n": 3.0, "tags": []any{"a", true}}, false},
+		{"string value", map[string]any{"name": "a\x00"}, true},
+		{"object key", map[string]any{"na\x00me": "x"}, true},
+		{"nested array", map[string]any{"list": []any{"ok", map[string]any{"deep": "\x00"}}}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ContainsNUL(tt.v); got != tt.want {
+				t.Errorf("ContainsNUL = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
