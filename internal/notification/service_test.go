@@ -3,8 +3,12 @@ package notification
 import (
 	"context"
 	"errors"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 
 	"notification-service/internal/domain"
 	"notification-service/internal/store"
@@ -137,3 +141,42 @@ func TestCreateBatch_SizeLimits(t *testing.T) {
 
 // Compile-time check that the real store satisfies the interface.
 var _ Store = (*store.Store)(nil)
+
+// templateStore serves one template on top of fakeStore.
+type templateStore struct {
+	*fakeStore
+	tmpl domain.Template
+}
+
+func (s templateStore) GetTemplate(context.Context, uuid.UUID) (domain.Template, error) {
+	return s.tmpl, nil
+}
+
+// Review finding: the render cap applied per item, so a 1000-item batch
+// of a template that repeats one variable thousands of times allocated
+// hundreds of megabytes before the length rules rejected it. Rendering
+// must stop as soon as an item is past its channel's limit.
+func TestCreateBatch_LargeTemplateRenderStopsAtTheChannelLimit(t *testing.T) {
+	tmpl := domain.Template{ID: uuid.Must(uuid.NewV7()), Name: "big", Channel: domain.ChannelSMS,
+		Body: strings.Repeat("{{.a}}", 3333)} // ~20 KB body, renders to ~63 KB per item
+	svc := NewService(templateStore{fakeStore: &fakeStore{byKey: map[string]domain.Notification{}}, tmpl: tmpl},
+		Config{Rules: validation.DefaultRules, BatchMaxSize: 1000, MaxAttempts: 5})
+	items := make([]CreateInput, 1000)
+	for i := range items {
+		items[i] = CreateInput{Channel: "sms", Recipient: "+905551234567", TemplateID: &tmpl.ID,
+			Variables: map[string]any{"a": strings.Repeat("x", 19)}}
+	}
+
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	_, _, err := svc.CreateBatch(context.Background(), items, "", "c")
+	runtime.ReadMemStats(&after)
+
+	var ve *domain.ValidationError
+	if !errors.As(err, &ve) || len(ve.Fields) != 1000 || ve.Fields[0].Field != "content" {
+		t.Fatalf("err = %v, want a content error for every item", err)
+	}
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 64<<20 {
+		t.Errorf("rejecting the batch allocated %d MiB, want < 64 MiB", allocated>>20)
+	}
+}

@@ -953,10 +953,12 @@ Mutable templates would need versioning, so that queued notifications don't
 change meaning; that's future work if marketing teams need it.
 
 **Safety.** Besides the syntax restriction above, the template body is capped
-at 20,000 characters, the request body at 1 MiB, and rendering stops at 64 KiB
-(`MaxRenderedBytes`): a body that repeats one large variable thousands of
-times cannot expand a request into megabytes before the channel length rules
-run.
+at 20,000 characters and the request body at 1 MiB (16 MiB for a batch).
+Rendering stops as soon as the output is certainly over the channel's limit
+(4 bytes per character, so 641 bytes for a 160-character SMS). Without that, a
+body that repeats one variable 3,333 times renders ~63 KB per item, and a
+1000-item batch allocated ~374 MB before the length rules rejected it (found
+in review; a unit test now measures the allocation).
 
 ---
 

@@ -18,13 +18,8 @@ import (
 // MaxBodyLength caps a template body (characters).
 const MaxBodyLength = 20_000
 
-// MaxRenderedBytes caps a rendered message. Every channel limit is far
-// below it; it exists so one variable repeated in a body cannot expand a
-// request into megabytes before the channel length rules run.
-const MaxRenderedBytes = 64 << 10
-
-// ErrRenderTooLarge is returned when rendering exceeds MaxRenderedBytes.
-var ErrRenderTooLarge = fmt.Errorf("rendered content exceeds %d bytes", MaxRenderedBytes)
+// ErrRenderTooLarge is returned when a render passes its byte limit.
+var ErrRenderTooLarge = errors.New("rendered content is too long")
 
 // Compiled is a parsed template plus the variables it needs.
 type Compiled struct {
@@ -135,7 +130,12 @@ func (e *MissingVariablesError) Error() string {
 
 // Render executes the template with vars. Every required variable must be
 // present (a value of "" or false is fine; absence is the error).
-func (c *Compiled) Render(vars map[string]any) (string, error) {
+//
+// Rendering stops with ErrRenderTooLarge as soon as the output passes
+// maxBytes. Callers pass the channel's limit, so a body that repeats one
+// variable thousands of times costs a few hundred bytes per item, not
+// tens of kilobytes times every item in a batch.
+func (c *Compiled) Render(vars map[string]any, maxBytes int) (string, error) {
 	var missing []string
 	for _, name := range c.Variables {
 		if _, ok := vars[name]; !ok {
@@ -148,21 +148,22 @@ func (c *Compiled) Render(vars map[string]any) (string, error) {
 	if vars == nil {
 		vars = map[string]any{}
 	}
-	var out cappedWriter
+	out := cappedWriter{max: maxBytes}
 	if err := c.tmpl.Execute(&out, vars); err != nil {
 		return "", fmt.Errorf("render template: %w", err)
 	}
 	return out.String(), nil
 }
 
-// cappedWriter stops a render at MaxRenderedBytes; text/template aborts
+// cappedWriter stops a render at max bytes; text/template aborts
 // execution on the first write error.
 type cappedWriter struct {
 	strings.Builder
+	max int
 }
 
 func (w *cappedWriter) Write(p []byte) (int, error) {
-	if w.Len()+len(p) > MaxRenderedBytes {
+	if w.Len()+len(p) > w.max {
 		return 0, ErrRenderTooLarge
 	}
 	return w.Builder.Write(p)

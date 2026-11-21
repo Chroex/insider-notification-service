@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
@@ -127,11 +128,16 @@ func (s *Service) applyTemplate(ctx context.Context, in *CreateInput, cache temp
 		return fieldErr("template_id", fmt.Sprintf("template is for channel %q, not %q", cached.tmpl.Channel, in.Channel)), nil
 	}
 
-	rendered, err := cached.compiled.Render(in.Variables)
+	// A character is at most 4 bytes in UTF-8, so output past this many
+	// bytes is certainly over the channel's limit: stop rendering there.
+	maxChars := s.cfg.Rules.MaxContentChars(cached.tmpl.Channel)
+	rendered, err := cached.compiled.Render(in.Variables, utf8.UTFMax*maxChars+1)
 	var missing *templating.MissingVariablesError
 	switch {
 	case errors.As(err, &missing):
 		return fieldErr("variables", "missing required variables: "+strings.Join(missing.Names, ", ")), nil
+	case errors.Is(err, templating.ErrRenderTooLarge):
+		return fieldErr("content", fmt.Sprintf("rendered content must be at most %d characters for this channel", maxChars)), nil
 	case err != nil:
 		return fieldErr("variables", err.Error()), nil
 	}

@@ -122,6 +122,19 @@ func inDays(d time.Duration) string {
 	return d.String()
 }
 
+// MaxContentChars is the content limit for channel, 0 for an unknown one.
+func (r Rules) MaxContentChars(channel domain.Channel) int {
+	switch channel {
+	case domain.ChannelSMS:
+		return r.SMSMaxChars
+	case domain.ChannelEmail:
+		return r.EmailMaxChars
+	case domain.ChannelPush:
+		return r.PushMaxChars
+	}
+	return 0
+}
+
 func (r Rules) checkLength(errs *[]domain.FieldError, content string, limit int) {
 	if n := utf8.RuneCountInString(content); n > limit {
 		*errs = append(*errs, domain.FieldError{
