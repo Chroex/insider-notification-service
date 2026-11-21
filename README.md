@@ -47,6 +47,7 @@ or binaries outside Docker.
 
 ```bash
 docker compose up --build        # or: make up  (detached)
+make smoke                       # ~40 end-to-end checks against the running stack, ~15s
 make seed                        # send a demo batch: every channel and priority, plus 2 forced failures
 ```
 
@@ -433,7 +434,17 @@ your shell, e.g. `MOCK_FAILURE_RATE=0.5 docker compose up`.
 make test-unit   # unit tests with -race; no Docker needed (~5s)
 make test        # unit + integration tests with -race; needs Docker (~30s)
 make lint        # go vet + golangci-lint (including integration-tagged files)
+make smoke       # end-to-end checks against the running stack (make up first)
 ```
+
+**`make smoke`** ([scripts/smoke.sh](scripts/smoke.sh)) drives the real stack
+(API, worker, mock provider, Postgres, Redis) through every main flow and
+prints one line per check: delivery on each channel with a
+`provider_message_id`, a permanent failure that is not retried, a retryable
+failure that is retried and then cancelled, manual retry, idempotent replay
+and conflict, a scheduled send, cancel and double-cancel, a batch, template
+rendering and rejected template loops, validation errors, 405, and the
+summary and Prometheus endpoints. It exits 1 if any check fails.
 
 Integration tests (build tag `integration`) start disposable PostgreSQL 16 and
 Redis 7 containers with **testcontainers-go** and use an in-process `httptest`
@@ -455,8 +466,7 @@ fake provider, so they are deterministic. They cover:
 **CI** ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs on every push and
 pull request: `go vet` + golangci-lint, unit + integration tests with `-race`
 (testcontainers on the GitHub runner), a Docker build of each image target,
-and an end-to-end job that runs `docker compose up`, seeds a batch and waits
-for deliveries.
+and an end-to-end job that runs `docker compose up` and `make smoke`.
 
 If Docker Desktop cannot pull testcontainers' helper image (Ryuk), run
 `TESTCONTAINERS_RYUK_DISABLED=true make test`; the tests remove their own

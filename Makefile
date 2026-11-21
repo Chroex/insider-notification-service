@@ -2,7 +2,7 @@ SHELL := /bin/bash
 GO    ?= go
 DB_URL ?= postgres://notifications:notifications@localhost:5432/notifications?sslmode=disable
 
-.PHONY: help build up down logs test test-unit lint migrate seed fmt
+.PHONY: help build up down logs test test-unit lint migrate seed smoke fmt
 
 help: ## Show available targets
 	@grep -E '^[a-z-]+:.*##' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-18s %s\n", $$1, $$2}'
@@ -38,6 +38,9 @@ migrate: ## Apply migrations to DB_URL using the migrate container
 
 seed: ## Send a demo batch (all channels/priorities, plus forced failures)
 	./scripts/seed.sh
+
+smoke: ## End-to-end checks against the running stack (run make up first)
+	./scripts/smoke.sh
 
 fmt: ## Format code
 	gofmt -w .
