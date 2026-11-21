@@ -15,11 +15,9 @@ func TestCompile_DiscoversRootVariables(t *testing.T) {
 		{"Hi {{.first_name}}", "first_name"},
 		{"{{.b}} {{.a}} {{.b}}", "a,b"},                         // sorted, deduplicated
 		{"{{if .vip}}Gold{{else}}{{.tier}}{{end}}", "tier,vip"}, // both branches
-		{`{{printf "%s-%d" .code .n}}`, "code,n"},               // function arguments
+		{"{{if .a}}A{{else if .b}}B{{end}}", "a,b"},             // else if
 		{"{{.order.id}}", "order"},                              // nested: top-level key
-		{"{{range .items}}{{.name}}{{end}}", "items"},           // .name is per-item
-		{"{{with .user}}{{.email}}{{else}}{{.fallback}}{{end}}", "fallback,user"},
-		{"{{$x := .greeting}}{{$x}}", "greeting"},
+		{"{{/* note */}}{{- .x -}}", "x"},                       // comments and trim markers
 	}
 	for _, tt := range tests {
 		c, err := Compile(tt.body)
@@ -36,6 +34,31 @@ func TestCompile_Rejects(t *testing.T) {
 	for _, body := range []string{"", "   ", "{{.unclosed", "{{end}}", strings.Repeat("x", MaxBodyLength+1)} {
 		if _, err := Compile(body); err == nil {
 			t.Errorf("Compile(%.20q...) succeeded, want error", body)
+		}
+	}
+}
+
+// Templates are variables and if/else only. Loops, functions, variables
+// and nested templates let one request burn the API's CPU or memory, e.g.
+// nested {{range}} over a large array or {{printf "%099999999d" 1}}.
+func TestCompile_RejectsLogicAndFunctions(t *testing.T) {
+	for _, body := range []string{
+		"{{range .items}}{{.}}{{end}}",
+		`{{printf "%099999999d" 1}}`,
+		"{{with .user}}{{.email}}{{end}}",
+		"{{call .fn}}",
+		"{{len .items}}",
+		"{{$x := .greeting}}{{$x}}",
+		`{{.a | printf "%s"}}`,
+		`{{define "x"}}hi{{end}}{{template "x"}}`,
+		"{{if eq .a .b}}same{{end}}",
+		"{{if .a}}{{range .b}}{{end}}{{end}}",
+		`{{"literal"}}`,
+		"{{.}}",
+	} {
+		_, err := Compile(body)
+		if err == nil || !strings.Contains(err.Error(), "only {{.variable}}") {
+			t.Errorf("Compile(%q) err = %v, want an unsupported-syntax error", body, err)
 		}
 	}
 }
@@ -71,5 +94,21 @@ func TestRender_ExtraVariablesAreIgnored(t *testing.T) {
 	c, _ := Compile("Hi {{.name}}")
 	if got, err := c.Render(map[string]any{"name": "Can", "unused": 1}); err != nil || got != "Hi Can" {
 		t.Errorf("Render = %q, %v", got, err)
+	}
+}
+
+// One variable repeated in a body must not expand a request into
+// megabytes before the channel length rules even run.
+func TestRender_CapsOutputSize(t *testing.T) {
+	c, err := Compile(strings.Repeat("{{.a}}", 100))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.Render(map[string]any{"a": strings.Repeat("x", 1024)}) // 100 KiB
+	if !errors.Is(err, ErrRenderTooLarge) {
+		t.Errorf("err = %v, want ErrRenderTooLarge", err)
+	}
+	if got, err := c.Render(map[string]any{"a": "x"}); err != nil || len(got) != 100 {
+		t.Errorf("small render = %d bytes, %v", len(got), err)
 	}
 }

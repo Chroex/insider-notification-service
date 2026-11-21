@@ -261,7 +261,10 @@ paths:
       tags: [templates]
       summary: Create a message template
       description: |
-        The body uses Go `text/template` syntax: `Hi {{.first_name}}`. It is
+        The body uses Go `text/template` syntax, limited to variables and
+        conditionals: `Hi {{.first_name}}`, `{{.order.id}}` and
+        `{{if .vip}}...{{else}}...{{end}}`. Loops, functions and variables
+        (`{{range}}`, `{{printf}}`, `{{$x}}`) are rejected with a 422. It is
         compiled on creation (syntax errors are rejected) and the variables it
         requires are returned. Templates are immutable, so a notification
         rendered from one never changes meaning later.
@@ -780,7 +783,9 @@ components:
         body:
           type: string
           maxLength: 20000
-          description: Go text/template syntax, e.g. `Hi {{.first_name}}`.
+          description: >
+            Go text/template syntax limited to `{{.variable}}` and
+            `{{if .variable}}...{{else}}...{{end}}`, e.g. `Hi {{.first_name}}`.
 
     Template:
       type: object

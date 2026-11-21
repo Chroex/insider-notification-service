@@ -913,10 +913,15 @@ to read and explain.
 - `POST /api/v1/templates` stores a Go `text/template` body (`Hi
   {{.first_name}}`). It is compiled on creation, so syntax errors fail
   immediately rather than on the first send. The response lists the
-  **required variables**, found by walking the parse tree: every field read
-  from the root data, including in `{{if}}` branches and function arguments,
-  but not fields inside `{{range}}`/`{{with}}` bodies, where the dot is rebound
-  (unit-tested).
+  **required variables**, found by walking the parse tree: every field read,
+  including in both `{{if}}` branches (unit-tested).
+- **Only variables and conditionals.** The same walk rejects everything but
+  text, `{{.name}}` / `{{.order.id}}` and `{{if .x}}...{{else}}...{{end}}`.
+  `text/template` has built-in functions and loops: `{{printf "%099999999d"
+  1}}` allocates ~100 MB, and nested `{{range}}` over a large array spins the
+  CPU. Either lets one API request hurt the service, and a notification
+  template does not need them (message logic belongs in the caller). Found by
+  probing the API; unit-tested with each rejected construct.
 - A notification gives either `content` or `template_id` + `variables`. The API
   renders the template **at create time** and stores the result as `content`
   (plus `template_id` and `variables` for traceability). Workers only ever see
@@ -942,9 +947,11 @@ current loyalty points), but turns client mistakes into asynchronous failures.
 Mutable templates would need versioning, so that queued notifications don't
 change meaning; that's future work if marketing teams need it.
 
-**Safety.** `text/template` has no loops without data and can't call functions
-unless they're registered, and the variables come from JSON (no functions). The
-template body is capped at 20,000 characters and the request body at 1 MiB.
+**Safety.** Besides the syntax restriction above, the template body is capped
+at 20,000 characters, the request body at 1 MiB, and rendering stops at 64 KiB
+(`MaxRenderedBytes`): a body that repeats one large variable thousands of
+times cannot expand a request into megabytes before the channel length rules
+run.
 
 ---
 

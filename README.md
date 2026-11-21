@@ -310,8 +310,9 @@ curl -X POST localhost:8080/api/v1/notifications/batch -H 'Content-Type: applica
         {"channel":"push","recipient":"device-token-abc","content":"You left items in your cart"}]}'
 ```
 
-**Create a template and send from it** (`{{.var}}` placeholders, Go
-`text/template` syntax; missing variables and over-long rendered output are 422s):
+**Create a template and send from it** (Go `text/template` syntax limited to
+`{{.var}}` placeholders and `{{if .var}}...{{else}}...{{end}}`; loops and
+functions, missing variables and over-long rendered output are 422s):
 
 ```bash
 curl -X POST localhost:8080/api/v1/templates -H 'Content-Type: application/json' \
