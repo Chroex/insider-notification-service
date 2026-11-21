@@ -19,6 +19,9 @@ backoff, and stop calling a failing provider.
   OpenTelemetry traces (Jaeger) from API request to provider call.
 
 Every significant choice is explained in [docs/DECISIONS.md](docs/DECISIONS.md).
+New to the code? [docs/WALKTHROUGH.md](docs/WALKTHROUGH.md) follows one
+notification from the API to the provider, explains the six ideas worth
+knowing well, and lists the bugs found along the way.
 
 ---
 
@@ -526,6 +529,8 @@ internal/
 migrations/       versioned SQL (golang-migrate)
 api/openapi.yaml  OpenAPI 3 spec (contract-tested)
 docs/DECISIONS.md architecture decision records
+docs/WALKTHROUGH.md one notification through the code, for explaining it
+scripts/          seed.sh (demo batch), smoke.sh (end-to-end checks)
 ```
 
 ---
