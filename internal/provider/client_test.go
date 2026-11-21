@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -138,6 +139,10 @@ func TestParseRetryAfter(t *testing.T) {
 		{"soon", 0},
 		{now.Add(90 * time.Second).Format(http.TimeFormat), 90 * time.Second},
 		{now.Add(-time.Minute).Format(http.TimeFormat), 0},
+		// Too large for a Duration: saturate (the worker caps it at 1h)
+		// rather than overflow to a negative value and retry too early.
+		{"99999999999", time.Duration(math.MaxInt64)},
+		{"9999999999999999999999999", time.Duration(math.MaxInt64)},
 	}
 	for _, tt := range tests {
 		if got := parseRetryAfter(tt.in, now); got != tt.want {

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -148,9 +149,12 @@ func parseRetryAfter(value string, now time.Time) time.Duration {
 	if value == "" {
 		return 0
 	}
-	if secs, err := strconv.Atoi(value); err == nil {
-		if secs < 0 {
-			return 0
+	if strings.Trim(value, "0123456789") == "" { // delay-seconds
+		secs, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || secs > math.MaxInt64/int64(time.Second) {
+			// Too large for a Duration: saturate rather than overflow, so
+			// "wait a very long time" stays long (the worker caps it).
+			return time.Duration(math.MaxInt64)
 		}
 		return time.Duration(secs) * time.Second
 	}
