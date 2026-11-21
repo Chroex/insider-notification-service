@@ -503,6 +503,12 @@ instead, which is worse for OTPs and order updates.
 - *Permanent:* any other 4xx, plus unexpected 1xx/3xx. These are failed
   immediately: an identical request cannot succeed, and retrying wastes quota
   and can get us rate-limited or flagged by the provider.
+- *Redirects are never followed* (`CheckRedirect` returns the 3xx as-is).
+  Go's default client would turn a 301/302/303 POST into a body-less GET, so
+  a 200 from the redirect target would mark a notification `sent` that the
+  provider never received; a 307/308 would re-send recipient and content to
+  whatever host the `Location` header names. A provider URL that redirects is
+  a configuration error, so the 3xx fails the notification visibly.
 - *Success:* any 2xx. The brief's provider returns 202; webhook.site defaults to
   200, so we accept both and store `messageId` when present.
 - An attempt is counted when it is *claimed* (that number is the fencing

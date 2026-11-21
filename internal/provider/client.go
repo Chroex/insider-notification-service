@@ -78,7 +78,15 @@ func NewClient(url string, timeout time.Duration) *Client {
 		url: url,
 		// otelhttp adds a client span per call and the W3C traceparent
 		// header, so a tracing-aware provider joins the same trace.
-		http:    &http.Client{Transport: otelhttp.NewTransport(transport)},
+		http: &http.Client{
+			Transport: otelhttp.NewTransport(transport),
+			// Never follow redirects. Go turns a 301/302/303 POST into a
+			// body-less GET, so a 200 from the target would count as
+			// "sent" although the provider never got the message; a
+			// 307/308 would re-send recipient and content to another
+			// host. The 3xx is returned as-is and classified permanent.
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		},
 		timeout: timeout,
 		now:     time.Now,
 	}

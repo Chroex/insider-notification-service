@@ -61,6 +61,34 @@ func TestSend_Plain200WithoutBodyIsAccepted(t *testing.T) {
 	}
 }
 
+// A redirect is never followed. Go's client would turn a 301/302/303 POST
+// into a body-less GET, so a 200 from the target would mark a notification
+// "sent" that the provider never received; a 307/308 would re-send the
+// recipient and content to whatever host the redirect names.
+func TestSend_RedirectIsNotFollowed(t *testing.T) {
+	for _, code := range []int{http.StatusFound, http.StatusTemporaryRedirect} {
+		targetHit := false
+		target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			targetHit = true
+			w.WriteHeader(http.StatusOK)
+		}))
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, target.URL, code)
+		}))
+
+		_, err := NewClient(srv.URL, time.Second).Send(context.Background(), testMessage())
+		se, ok := IsStatusError(err)
+		if !ok || se.StatusCode != code {
+			t.Errorf("redirect %d: err = %v, want a StatusError with that code", code, err)
+		}
+		if targetHit {
+			t.Errorf("redirect %d was followed", code)
+		}
+		srv.Close()
+		target.Close()
+	}
+}
+
 func TestSend_StatusErrorWithRetryAfter(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Retry-After", "7")
