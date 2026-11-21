@@ -5,7 +5,7 @@
 # main flows and checks the outcome of each. Prints one line per check and
 # exits 1 if any check failed. Needs curl and jq.
 #
-# Runs in about half a minute. Random mock failures (MOCK_FAILURE_RATE) only
+# Runs in about 15 seconds. Random mock failures (MOCK_FAILURE_RATE) only
 # make some sends retry; the waits below allow for that.
 set -uo pipefail
 
@@ -77,7 +77,13 @@ expect "permanent failure is not retried" \
 create '{"channel":"email","recipient":"smoke@example.com","content":"smoke [mock:503]"}'
 retrying=$id
 expect "503 from provider is retried" "$(wait_status "$retrying" retrying 20)" retrying
-request POST "/api/v1/notifications/$retrying/cancel"
+# The worker may claim the row again between our read and the cancel
+# (it is 'processing' for a moment, and cancel answers 409); try again.
+for _ in 1 2 3 4 5; do
+  request POST "/api/v1/notifications/$retrying/cancel"
+  [[ "$status" == 200 ]] && break
+  wait_status "$retrying" retrying 20 >/dev/null
+done
 expect "a retrying notification can be cancelled" "$(jq -r .status <<<"$body")" cancelled
 
 request POST "/api/v1/notifications/$permanent/retry"
@@ -146,7 +152,10 @@ section "Observability"
 request GET "/api/v1/metrics/summary?window=15m"
 expect "summary endpoint" "$status" 200
 [[ $(jq '.overall.sent' <<<"$body") -ge 1 ]] && pass "summary counts sent notifications" || fail "summary shows no sent notifications"
-curl -sS "$WORKER/metrics" | grep -q '^notifications_sent_total' &&
+# Capture first: `curl | grep -q` fails under pipefail when grep exits
+# early and curl gets SIGPIPE on a large body.
+metrics=$(curl -sS "$WORKER/metrics")
+grep -q '^notifications_sent_total' <<<"$metrics" &&
   pass "worker exports Prometheus metrics" || fail "worker metrics missing notifications_sent_total"
 
 echo

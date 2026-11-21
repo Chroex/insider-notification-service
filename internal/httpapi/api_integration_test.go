@@ -351,11 +351,12 @@ func TestIdempotency_ReplayAndConflict(t *testing.T) {
 func TestIdempotency_ReplaySkipsValidation(t *testing.T) {
 	db.Reset(t)
 	body := sms("later")
-	body["scheduled_at"] = time.Now().Add(time.Second).UTC().Format(time.RFC3339Nano)
+	at := time.Now().Add(2 * time.Second) // margin for a slow CI runner
+	body["scheduled_at"] = at.UTC().Format(time.RFC3339Nano)
 	first := call(t, "POST", "/api/v1/notifications", body, "Idempotency-Key", "sched-1")
 	expectStatus(t, first, http.StatusCreated)
 
-	time.Sleep(1200 * time.Millisecond) // scheduled_at is now in the past
+	time.Sleep(time.Until(at) + 200*time.Millisecond) // scheduled_at is now in the past
 	replay := call(t, "POST", "/api/v1/notifications", body, "Idempotency-Key", "sched-1")
 	expectStatus(t, replay, http.StatusOK)
 	if replay.Body["id"] != first.Body["id"] {
@@ -641,12 +642,13 @@ func TestBatch_Idempotency(t *testing.T) {
 func TestBatch_IdempotentReplaySkipsValidation(t *testing.T) {
 	db.Reset(t)
 	later := sms("later")
-	later["scheduled_at"] = time.Now().Add(time.Second).UTC().Format(time.RFC3339Nano)
+	at := time.Now().Add(2 * time.Second) // margin for a slow CI runner
+	later["scheduled_at"] = at.UTC().Format(time.RFC3339Nano)
 	body := map[string]any{"notifications": []any{sms("now"), later}}
 	first := call(t, "POST", "/api/v1/notifications/batch", body, "Idempotency-Key", "campaign-8")
 	expectStatus(t, first, http.StatusCreated)
 
-	time.Sleep(1200 * time.Millisecond) // item 1's scheduled_at is now in the past
+	time.Sleep(time.Until(at) + 200*time.Millisecond) // item 1's scheduled_at is now in the past
 	replay := call(t, "POST", "/api/v1/notifications/batch", body, "Idempotency-Key", "campaign-8")
 	expectStatus(t, replay, http.StatusOK)
 	if replay.Body["batch_id"] != first.Body["batch_id"] ||
