@@ -854,7 +854,7 @@ components:
             code:
               type: string
               enum: [invalid_json, invalid_parameter, validation_failed, not_found,
-                     idempotency_conflict, invalid_state, template_name_taken,
+                     method_not_allowed, idempotency_conflict, invalid_state, template_name_taken,
                      payload_too_large, internal_error]
             message: { type: string }
             details:

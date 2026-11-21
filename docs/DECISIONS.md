@@ -425,6 +425,11 @@ the provider; claiming we cancelled it would be a lie.
   SQL or hostnames never leak.
 - **400 vs 422:** 400 when the request can't be parsed (bad JSON, unknown field,
   bad query parameter); 422 when it parses but breaks a business rule.
+- **404 vs 405:** an unknown path is a 404; a known path with the wrong method
+  (`PUT /api/v1/notifications`) is a 405 with an `Allow` header. Go's router
+  already makes that distinction but answers in plain text, so a small
+  fallback (`jsonFallback`) asks the router and replies in the JSON error
+  shape.
 - **Strict JSON:** unknown fields are rejected (`DisallowUnknownFields`), so
   `"recipent"` fails loudly instead of being silently ignored. Bodies are
   size-limited (1 MiB single, 16 MiB batch).

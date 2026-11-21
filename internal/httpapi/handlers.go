@@ -250,10 +250,6 @@ func (h *handlers) statusStream(w http.ResponseWriter, r *http.Request) {
 }
 
 // notFound returns the standard error body for unknown routes.
-func notFound(w http.ResponseWriter, r *http.Request) {
-	writeError(w, r, http.StatusNotFound, codeNotFound, "no route for "+r.Method+" "+r.URL.Path, nil)
-}
-
 // --- request parsing helpers ---
 
 func pathUUID(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {

@@ -14,6 +14,7 @@ const (
 	codeInvalidParameter    = "invalid_parameter"
 	codeValidationFailed    = "validation_failed"
 	codeNotFound            = "not_found"
+	codeMethodNotAllowed    = "method_not_allowed"
 	codeIdempotencyConflict = "idempotency_conflict"
 	codeTemplateNameTaken   = "template_name_taken"
 	codeInvalidState        = "invalid_state"

@@ -54,13 +54,46 @@ func NewRouter(opts Options) http.Handler {
 	for _, rt := range h.routes() {
 		mux.HandleFunc(rt.pattern, rt.handler)
 	}
-	// "/" matches anything not matched above: JSON 404 instead of text/plain.
-	mux.HandleFunc("/", notFound)
 
-	return chain(mux, tracing, cors(opts.CORSAllowedOrigins), correlationID(opts.Logger), requestLogger, recoverer, httpMetrics(metrics))
+	return chain(jsonFallback(mux), tracing, cors(opts.CORSAllowedOrigins), correlationID(opts.Logger), requestLogger, recoverer, httpMetrics(metrics))
 }
 
 const metricsPattern = "GET /metrics"
+
+// jsonFallback serves mux, but answers requests no route matches in the
+// API's JSON error shape. Go's router already knows the difference between
+// an unknown path (404) and a known path with the wrong method (405, with
+// an Allow header); it just answers in plain text. We ask it, then reply
+// in JSON.
+func jsonFallback(mux *http.ServeMux) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fallback, pattern := mux.Handler(r)
+		if pattern != "" {
+			mux.ServeHTTP(w, r)
+			return
+		}
+		answer := &recordedAnswer{header: http.Header{}}
+		fallback.ServeHTTP(answer, r)
+		if answer.status == http.StatusMethodNotAllowed {
+			w.Header().Set("Allow", answer.header.Get("Allow"))
+			writeError(w, r, http.StatusMethodNotAllowed, codeMethodNotAllowed,
+				r.Method+" is not supported for "+r.URL.Path, nil)
+			return
+		}
+		writeError(w, r, http.StatusNotFound, codeNotFound, "no route for "+r.Method+" "+r.URL.Path, nil)
+	})
+}
+
+// recordedAnswer captures the status and headers of the router's own
+// plain-text 404/405 reply and discards its body.
+type recordedAnswer struct {
+	header http.Header
+	status int
+}
+
+func (a *recordedAnswer) Header() http.Header         { return a.header }
+func (a *recordedAnswer) Write(b []byte) (int, error) { return len(b), nil }
+func (a *recordedAnswer) WriteHeader(status int)      { a.status = status }
 
 type route struct {
 	pattern string
