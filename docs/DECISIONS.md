@@ -155,6 +155,25 @@ and API payloads.
 rejects bad values; the claim index sorts on a compact integer. Text sorting
 would have put `high < low < normal`, which is why the rank exists.
 
+**Cross-column invariants are CHECKs too** (migration 000008). Every code path
+already keeps them, and the database now refuses a row that breaks them:
+
+| Constraint | Why it matters |
+|---|---|
+| `processing` ⇔ `locked_until` set | A `processing` row without a lease is never reaped: stuck forever |
+| `sent` ⇔ `sent_at` set | End-to-end latency and the summary read `sent_at` |
+| `scheduled` ⇒ `scheduled_at` set | The API exposes it as the due time |
+| `attempts <= max_attempts` | A row cannot loop past its budget |
+| idempotency key ⇔ request hash | Replay vs. conflict needs both |
+| `variables` ⇒ `template_id` | Variables only mean something with a template |
+
+A bug in a future UPDATE then fails loudly in tests instead of leaving
+quietly wrong rows. Two existing tests that forced impossible states (e.g.
+`processing` without a lease) were fixed to produce realistic ones. The claim
+query skips rows with `attempts >= max_attempts`: without that guard, one
+such row would make the claim's `attempts + 1` violate the constraint and
+fail the whole statement, blocking the channel (tested).
+
 ---
 
 ## ADR-004: Partial indexes tailored to each query

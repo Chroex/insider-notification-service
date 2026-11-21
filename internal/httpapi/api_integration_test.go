@@ -398,16 +398,27 @@ func TestCancel(t *testing.T) {
 	expectStatus(t, r, http.StatusNotFound)
 }
 
+// forceStatus moves a notification to status the way a worker would,
+// including the columns the schema's invariants tie to it (a lease while
+// processing, sent_at once sent).
+func forceStatus(t *testing.T, id, status string) {
+	t.Helper()
+	if _, err := db.Pool.Exec(context.Background(), `
+		UPDATE notifications
+		SET status = $1,
+		    locked_until = CASE WHEN $1 = 'processing' THEN now() + interval '30 seconds' END,
+		    sent_at      = CASE WHEN $1 = 'sent' THEN now() END
+		WHERE id = $2`, status, id); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCancel_NotAllowedOnceProcessingOrSent(t *testing.T) {
 	for _, status := range []string{"processing", "sent", "failed"} {
 		t.Run(status, func(t *testing.T) {
 			db.Reset(t)
 			id := call(t, "POST", "/api/v1/notifications", sms("hi")).Body["id"].(string)
-			// Simulate the worker having moved it on.
-			if _, err := db.Pool.Exec(context.Background(),
-				"UPDATE notifications SET status = $1 WHERE id = $2", status, id); err != nil {
-				t.Fatal(err)
-			}
+			forceStatus(t, id, status) // simulate the worker having moved it on
 			r := call(t, "POST", "/api/v1/notifications/"+id+"/cancel", nil)
 			expectStatus(t, r, http.StatusConflict)
 			msg := r.Body["error"].(map[string]any)["message"].(string)
@@ -680,10 +691,7 @@ func TestRetry_OnlyFromFailed(t *testing.T) {
 	db.Reset(t)
 	for _, status := range []string{"pending", "processing", "sent", "cancelled"} {
 		id := call(t, "POST", "/api/v1/notifications", sms(status)).Body["id"].(string)
-		if _, err := db.Pool.Exec(context.Background(),
-			"UPDATE notifications SET status = $1 WHERE id = $2", status, id); err != nil {
-			t.Fatal(err)
-		}
+		forceStatus(t, id, status)
 		r := call(t, "POST", "/api/v1/notifications/"+id+"/retry", nil)
 		if r.Status != http.StatusConflict {
 			t.Errorf("retry from %s: status %d, want 409", status, r.Status)

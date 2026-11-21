@@ -54,6 +54,10 @@ func (q *Queue) Claim(ctx context.Context, channel domain.Channel, limit int, le
 			WHERE status IN ('scheduled', 'pending', 'retrying')
 			  AND channel = $1
 			  AND next_attempt_at <= now()
+			  -- Never true for rows our own transitions produce. It keeps one
+			  -- inconsistent row from failing the whole claim on the
+			  -- attempts <= max_attempts constraint and blocking the channel.
+			  AND attempts < max_attempts
 			ORDER BY priority_rank, next_attempt_at
 			LIMIT $2
 			FOR UPDATE SKIP LOCKED

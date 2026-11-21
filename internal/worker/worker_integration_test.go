@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/prometheus/client_golang/prometheus"
 	promtest "github.com/prometheus/client_golang/prometheus/testutil"
 	"go.opentelemetry.io/otel"
@@ -567,6 +568,46 @@ func TestQueue_StaleWorkerCannotOverwriteNewerClaim(t *testing.T) {
 	}
 	if as := attempts(t, n.ID); len(as) != 1 || as[0].AttemptNo != 1 {
 		t.Errorf("the stale attempt should still be recorded in history: %+v", as)
+	}
+}
+
+// The schema rejects states no code path should produce (migration 000008).
+func TestSchema_RejectsInconsistentStates(t *testing.T) {
+	db.Reset(t)
+	n := insertNotification(t, domain.ChannelSMS)
+	for name, update := range map[string]string{
+		"processing without a lease": `SET status = 'processing'`,
+		"lease while pending":        `SET locked_until = now()`,
+		"sent without sent_at":       `SET status = 'sent'`,
+		"sent_at while pending":      `SET sent_at = now()`,
+		"scheduled without a time":   `SET status = 'scheduled'`,
+		"attempts over budget":       `SET attempts = max_attempts + 1`,
+		"idempotency key, no hash":   `SET idempotency_key = 'k'`,
+		"variables without template": `SET variables = '{}'`,
+	} {
+		_, err := db.Pool.Exec(context.Background(), `UPDATE notifications `+update+` WHERE id = $1`, n.ID)
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "23514" {
+			t.Errorf("%s: err = %v, want a check_violation", name, err)
+		}
+	}
+}
+
+// A row whose budget is already spent must be skipped, not claimed: the
+// claim's attempts + 1 would violate notifications_attempts_within_budget,
+// fail the whole claim statement and block the channel for every row.
+func TestQueue_ClaimSkipsRowsWithNoBudgetLeft(t *testing.T) {
+	db.Reset(t)
+	ctx := context.Background()
+	spent := insertNotification(t, domain.ChannelSMS, withMaxAttempts(2))
+	if _, err := db.Pool.Exec(ctx, `UPDATE notifications SET attempts = 2 WHERE id = $1`, spent.ID); err != nil {
+		t.Fatal(err)
+	}
+	healthy := insertNotification(t, domain.ChannelSMS)
+
+	jobs, err := queue.New(db.Pool).Claim(ctx, domain.ChannelSMS, 10, time.Minute)
+	if err != nil || len(jobs) != 1 || jobs[0].ID != healthy.ID {
+		t.Fatalf("claim = %+v, %v; want only the row with budget left", jobs, err)
 	}
 }
 
