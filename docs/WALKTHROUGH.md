@@ -96,8 +96,10 @@ the provider banning us.
 succeed later (timeouts, 5xx, 429, 408). Backoff is exponential with full
 jitter (base 2 s, cap 5 min) so a provider outage does not turn into
 synchronized retry waves, and a longer `Retry-After` wins. A per-channel
-circuit breaker opens after 5 *different* notifications fail within a minute,
-stops claiming for 30 s, then lets one probe through. While it is open nothing
+circuit breaker opens after a streak of retryable failures from 5 *different*
+notifications (a success or a permanent 4xx resets the streak, and so does a
+gap of more than a minute between failures), stops claiming for 30 s, then
+lets one probe through. While it is open nothing
 is claimed, so no attempts are burned.
 
 **6. You can see everything** (ADR-026, ADR-030). One correlation ID in every
@@ -134,11 +136,13 @@ make seed            # a batch with every channel, a 400 and a 503
 1. **Swagger** at http://localhost:8081: create a notification, read it back
    with its attempts.
 2. **Retries**: `GET /api/v1/notifications/{id}` for the `[mock:503]` item from
-   the seed batch shows attempts with growing gaps, then `failed`;
+   the seed batch shows five attempts, spaced by a random delay whose upper
+   bound doubles each time (full jitter), then `failed`;
    `POST .../retry` re-queues it.
 3. **Crash recovery**: slow the mock (`MOCK_LATENCY_MIN=3s MOCK_LATENCY_MAX=4s
    docker compose up -d mockprovider`), send a few notifications,
    `docker compose kill -s SIGKILL worker`, start it again. About 40 s later
-   each one shows attempt 1 `interrupted` and attempt 2 `success`.
+   each one shows attempt 1 `interrupted`, then a successful attempt (set
+   `MOCK_FAILURE_RATE=0` too if you want exactly two attempts each).
 4. **Observability**: `curl -s 'localhost:8080/api/v1/metrics/summary?window=15m' | jq .overall`,
    then one trace in Jaeger at http://localhost:16686 (service `api`).
