@@ -491,6 +491,16 @@ it.
   that stalls past its lease cannot overwrite the result of the worker that
   re-claimed the row; it gets `ErrLeaseLost`. Its attempt is still written to
   `delivery_attempts`, because the call really happened. (Tested.)
+- **The lost call is in the history** (migration 000009). The reaper writes
+  the crashed claim's attempt as `outcome = 'interrupted'`, started at the
+  claim (the row's `updated_at`) with no duration, because it is unknown.
+  Without it, `GET /notifications/{id}` would skip an attempt number and hide
+  the one fact support needs: *this message may already have been
+  delivered*. If the stalled worker reports later, its real result replaces
+  the placeholder (`ON CONFLICT ... DO UPDATE ... WHERE outcome =
+  'interrupted'`). Interrupted calls count in `delivery_attempts_total` and
+  the summary's `attempts.interrupted`, and are left out of latency
+  percentiles. (Tested.)
 - `LEASE_DURATION >= 2 x PROVIDER_TIMEOUT` is enforced at startup, so a healthy
   send can never outlive its lease.
 
@@ -533,7 +543,8 @@ instead, which is worse for OTPs and order updates.
 - An attempt is counted when it is *claimed* (that number is the fencing
   token). A job released on graceful shutdown before its send started has the
   attempt refunded. A job reaped after a crash keeps it, because we can't know
-  whether the provider got it.
+  whether the provider got it, and that attempt is recorded as `interrupted`
+  (ADR-018).
 - `Retry-After` (seconds or HTTP-date) is honoured when it asks for longer than
   our own delay.
 

@@ -534,6 +534,29 @@ func TestQueue_ReapExpiredLeases(t *testing.T) {
 	if s := get(t, healthy.ID).Status; s != domain.StatusProcessing {
 		t.Errorf("healthy lease status = %s, want processing", s)
 	}
+
+	// The lost calls are in the history as interrupted, with the attempt
+	// number the crashed claim used and no (unknown) duration.
+	for _, tc := range []struct {
+		id      uuid.UUID
+		attempt int
+	}{{recoverable.ID, 1}, {exhausted.ID, 2}} {
+		as := attempts(t, tc.id)
+		if len(as) != 1 || as[0].AttemptNo != tc.attempt || as[0].Outcome != domain.OutcomeInterrupted || as[0].DurationMS != nil {
+			t.Errorf("attempts of %s = %+v, want one interrupted attempt %d without duration", tc.id, as, tc.attempt)
+		}
+	}
+	if as := attempts(t, healthy.ID); len(as) != 0 {
+		t.Errorf("a live lease must not get an interrupted attempt: %+v", as)
+	}
+	if res.InterruptedByChannel[domain.ChannelSMS] != 2 {
+		t.Errorf("interrupted by channel = %v, want sms: 2", res.InterruptedByChannel)
+	}
+
+	// A second pass finds nothing left to reap.
+	if again, err := q.ReapExpired(ctx); err != nil || again.Requeued+again.Failed != 0 {
+		t.Errorf("second reap = %+v, %v; want a no-op", again, err)
+	}
 }
 
 func TestQueue_StaleWorkerCannotOverwriteNewerClaim(t *testing.T) {
@@ -557,7 +580,7 @@ func TestQueue_StaleWorkerCannotOverwriteNewerClaim(t *testing.T) {
 	// The stalled first worker finally reports success with attempt 1.
 	err = q.Complete(ctx, queue.Completion{
 		ID: n.ID, AttemptNo: first[0].Attempts, Status: domain.StatusSent,
-		Attempt: domain.DeliveryAttempt{StartedAt: time.Now(), Outcome: domain.OutcomeSuccess},
+		Attempt: domain.DeliveryAttempt{StartedAt: time.Now(), DurationMS: new(5), Outcome: domain.OutcomeSuccess},
 	})
 	if !errors.Is(err, queue.ErrLeaseLost) {
 		t.Fatalf("stale complete err = %v, want ErrLeaseLost", err)
@@ -566,8 +589,10 @@ func TestQueue_StaleWorkerCannotOverwriteNewerClaim(t *testing.T) {
 	if got.Status != domain.StatusProcessing || got.Attempts != 2 {
 		t.Errorf("row = %s attempts %d; the newer claim must be untouched", got.Status, got.Attempts)
 	}
-	if as := attempts(t, n.ID); len(as) != 1 || as[0].AttemptNo != 1 {
-		t.Errorf("the stale attempt should still be recorded in history: %+v", as)
+	// The reaper wrote attempt 1 as interrupted; the stale worker's real
+	// result replaces that placeholder.
+	if as := attempts(t, n.ID); len(as) != 1 || as[0].AttemptNo != 1 || as[0].Outcome != domain.OutcomeSuccess {
+		t.Errorf("the stale attempt's real result should be in history: %+v", as)
 	}
 }
 
@@ -864,7 +889,7 @@ func TestMetrics_RecordedForDeliveries(t *testing.T) {
 	}
 
 	err := promtest.GatherAndCompare(reg, strings.NewReader(`
-# HELP delivery_attempts_total Provider calls by outcome (success, retryable_error, permanent_error).
+# HELP delivery_attempts_total Provider calls by outcome (success, retryable_error, permanent_error, interrupted).
 # TYPE delivery_attempts_total counter
 delivery_attempts_total{channel="email",outcome="permanent_error"} 1
 delivery_attempts_total{channel="sms",outcome="success"} 2
@@ -1020,7 +1045,7 @@ func TestQueue_DueTimesUseTheDatabaseClock(t *testing.T) {
 	// A retry with zero delay is due immediately by the database clock.
 	if err := q.Complete(ctx, queue.Completion{
 		ID: n.ID, AttemptNo: jobs[0].Attempts, Status: domain.StatusRetrying, RetryDelay: new(time.Duration),
-		Attempt: domain.DeliveryAttempt{StartedAt: time.Now(), Outcome: domain.OutcomeRetryableError},
+		Attempt: domain.DeliveryAttempt{StartedAt: time.Now(), DurationMS: new(5), Outcome: domain.OutcomeRetryableError},
 	}); err != nil {
 		t.Fatal(err)
 	}

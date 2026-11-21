@@ -36,7 +36,7 @@ func TestWorkerMetrics_Events(t *testing.T) {
 	m.AttemptFinished(domain.ChannelSMS, domain.OutcomeRetryableError, 10*time.Millisecond)
 	m.NotificationSent(domain.ChannelSMS, 2*time.Second)
 	m.NotificationFailed(domain.ChannelEmail, "permanent_error")
-	m.LeasesReaped(2, map[domain.Channel]int{domain.ChannelPush: 1})
+	m.LeasesReaped(2, map[domain.Channel]int{domain.ChannelPush: 1}, map[domain.Channel]int{domain.ChannelPush: 3})
 	m.BreakerStateChanged(domain.ChannelEmail, 1)
 
 	checks := []struct {
@@ -50,6 +50,7 @@ func TestWorkerMetrics_Events(t *testing.T) {
 		{"failed permanent", m.failed.WithLabelValues("email", "permanent_error"), 1},
 		{"failed lease_expired", m.failed.WithLabelValues("push", "lease_expired"), 1},
 		{"reaped requeued", m.leasesReaped.WithLabelValues("requeued"), 2},
+		{"attempts interrupted", m.attempts.WithLabelValues("push", "interrupted"), 3},
 		{"breaker email open", m.breakerState.WithLabelValues("email"), 1},
 		{"breaker sms closed", m.breakerState.WithLabelValues("sms"), 0},
 	}

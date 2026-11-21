@@ -117,7 +117,8 @@ type Completion struct {
 // attempt number. If the lease expired and the row was re-queued or claimed
 // again, it matches nothing and we return ErrLeaseLost instead of clobbering
 // the newer state. The attempt row is still committed: the provider call
-// really happened, and the history should say so.
+// really happened, and the history should say so. If the reaper already
+// wrote that attempt as 'interrupted', the real result replaces it.
 func (q *Queue) Complete(ctx context.Context, c Completion) error {
 	tx, err := q.pool.Begin(ctx)
 	if err != nil {
@@ -126,12 +127,22 @@ func (q *Queue) Complete(ctx context.Context, c Completion) error {
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	a := c.Attempt
-	if _, err := tx.Exec(ctx, `
+	inserted, err := tx.Exec(ctx, `
 		INSERT INTO delivery_attempts
 			(notification_id, attempt_no, started_at, duration_ms, http_status, error, outcome)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		c.ID, c.AttemptNo, a.StartedAt, a.DurationMS, a.HTTPStatus, a.Error, a.Outcome); err != nil {
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT (notification_id, attempt_no) DO UPDATE
+		SET started_at = EXCLUDED.started_at, duration_ms = EXCLUDED.duration_ms,
+		    http_status = EXCLUDED.http_status, error = EXCLUDED.error, outcome = EXCLUDED.outcome
+		WHERE delivery_attempts.outcome = 'interrupted'`,
+		c.ID, c.AttemptNo, a.StartedAt, a.DurationMS, a.HTTPStatus, a.Error, a.Outcome)
+	if err != nil {
 		return fmt.Errorf("complete: insert attempt: %w", err)
+	}
+	if inserted.RowsAffected() == 0 {
+		// Only one claim can produce an attempt number, so a real result
+		// already stored for it means a bug, not a race.
+		return fmt.Errorf("complete: attempt %d of %s is already recorded", c.AttemptNo, c.ID)
 	}
 
 	tag, err := tx.Exec(ctx, `
@@ -184,9 +195,10 @@ func (q *Queue) Release(ctx context.Context, jobs []domain.Notification) (int64,
 
 // ReapResult counts what the reaper did.
 type ReapResult struct {
-	Requeued        int
-	Failed          int
-	FailedByChannel map[domain.Channel]int
+	Requeued             int
+	Failed               int
+	FailedByChannel      map[domain.Channel]int
+	InterruptedByChannel map[domain.Channel]int // attempts recorded as interrupted
 }
 
 // ReapExpired is crash recovery. A row still 'processing' after its lease
@@ -194,31 +206,58 @@ type ReapResult struct {
 // 'pending'. The provider may or may not have received it, so this is
 // what makes delivery at-least-once rather than at-most-once.
 //
+// The lost call is written to delivery_attempts as 'interrupted' (started
+// at the claim, which is the row's updated_at; duration unknown), so the
+// history has no gap and shows that this message may have been delivered.
+// If the stalled worker reports later, Complete replaces it with the real
+// result.
+//
 // The attempt is not refunded (we can't know whether the provider got it),
 // so a row whose budget is exhausted is failed instead of looping forever.
-// Running the reaper on several worker replicas at once is safe: the UPDATE
-// is idempotent and row locks serialize it.
+// Running the reaper on several worker replicas at once is safe: SKIP
+// LOCKED gives each row to one reaper, and the status check makes a repeat
+// a no-op.
 func (q *Queue) ReapExpired(ctx context.Context) (ReapResult, error) {
 	rows, err := q.pool.Query(ctx, `
-		UPDATE notifications
-		SET status = CASE WHEN attempts >= max_attempts THEN 'failed' ELSE 'pending' END,
-		    last_error = CASE WHEN attempts >= max_attempts
-		                      THEN 'lease expired on final attempt (worker crashed or stalled)'
-		                      ELSE 'lease expired, re-queued (worker crashed or stalled)' END,
-		    locked_until = NULL,
-		    next_attempt_at = now()
-		WHERE status = 'processing' AND locked_until < now()
-		RETURNING status, channel`)
+		WITH expired AS (
+			SELECT id, attempts, updated_at AS claimed_at
+			FROM notifications
+			WHERE status = 'processing' AND locked_until < now()
+			FOR UPDATE SKIP LOCKED
+		), reaped AS (
+			UPDATE notifications n
+			SET status = CASE WHEN n.attempts >= n.max_attempts THEN 'failed' ELSE 'pending' END,
+			    last_error = CASE WHEN n.attempts >= n.max_attempts
+			                      THEN 'lease expired on final attempt (worker crashed or stalled)'
+			                      ELSE 'lease expired, re-queued (worker crashed or stalled)' END,
+			    locked_until = NULL,
+			    next_attempt_at = now()
+			FROM expired e
+			WHERE n.id = e.id
+			RETURNING n.id, n.status, n.channel, e.attempts, e.claimed_at
+		), interrupted AS (
+			INSERT INTO delivery_attempts (notification_id, attempt_no, started_at, error, outcome)
+			SELECT id, attempts, claimed_at,
+			       'worker lease expired before the result was recorded; the provider may have received it',
+			       'interrupted'
+			FROM reaped
+			WHERE attempts > 0
+			ON CONFLICT (notification_id, attempt_no) DO NOTHING
+			RETURNING notification_id
+		)
+		SELECT r.status, r.channel, i.notification_id IS NOT NULL
+		FROM reaped r LEFT JOIN interrupted i ON i.notification_id = r.id`)
 	if err != nil {
 		return ReapResult{}, fmt.Errorf("reap: %w", err)
 	}
 	defer rows.Close()
 
-	res := ReapResult{FailedByChannel: map[domain.Channel]int{}}
+	res := ReapResult{FailedByChannel: map[domain.Channel]int{}, InterruptedByChannel: map[domain.Channel]int{}}
 	for rows.Next() {
 		var status domain.Status
 		var channel domain.Channel
-		if err := rows.Scan(&status, &channel); err != nil {
+		var interrupted bool
+		if err := rows.Scan(&status, &channel, &interrupted); err != nil {
 			return ReapResult{}, fmt.Errorf("reap: scan: %w", err)
 		}
 		if status == domain.StatusFailed {
@@ -226,6 +265,9 @@ func (q *Queue) ReapExpired(ctx context.Context) (ReapResult, error) {
 			res.FailedByChannel[channel]++
 		} else {
 			res.Requeued++
+		}
+		if interrupted {
+			res.InterruptedByChannel[channel]++
 		}
 	}
 	return res, rows.Err()

@@ -24,6 +24,7 @@ type attemptsResponse struct {
 	Success        int      `json:"success"`
 	RetryableError int      `json:"retryable_error"`
 	PermanentError int      `json:"permanent_error"`
+	Interrupted    int      `json:"interrupted"`
 	SuccessRate    *float64 `json:"success_rate"`
 }
 
@@ -99,8 +100,9 @@ func toStatsResponse(s store.ChannelStats) statsResponse {
 		Success:        s.AttemptsByOutcome[domain.OutcomeSuccess],
 		RetryableError: s.AttemptsByOutcome[domain.OutcomeRetryableError],
 		PermanentError: s.AttemptsByOutcome[domain.OutcomePermanentError],
+		Interrupted:    s.AttemptsByOutcome[domain.OutcomeInterrupted],
 	}
-	a.Total = a.Success + a.RetryableError + a.PermanentError
+	a.Total = a.Success + a.RetryableError + a.PermanentError + a.Interrupted
 	a.SuccessRate = ratio(a.Success, a.Total)
 	return statsResponse{
 		Sent:              s.Sent,

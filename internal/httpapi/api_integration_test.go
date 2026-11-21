@@ -803,6 +803,10 @@ func TestMetricsSummary(t *testing.T) {
 	}
 	failed := insert("sms", "failed", 0, false)
 	attempt(failed, 1000, "permanent_error", "1 minute")
+	// A call lost to a worker crash: counted, but its unknown (NULL)
+	// duration must not distort the latency percentiles.
+	exec(`INSERT INTO delivery_attempts (notification_id, attempt_no, started_at, outcome)
+		VALUES ($1, 2, now() - interval '1 minute', 'interrupted')`, failed)
 	// Queue: 2 pending email, 1 retrying push.
 	insert("email", "pending", 0, false)
 	insert("email", "pending", 0, false)
@@ -825,9 +829,10 @@ func TestMetricsSummary(t *testing.T) {
 		"sent":                  {overall["sent"], 4.0},
 		"failed":                {overall["failed"], 1.0},
 		"success_rate":          {overall["success_rate"], 0.8},
-		"attempts.total":        {attempts["total"], 5.0},
+		"attempts.total":        {attempts["total"], 6.0},
 		"attempts.permanent":    {attempts["permanent_error"], 1.0},
-		"attempts.success_rate": {attempts["success_rate"], 0.8},
+		"attempts.interrupted":  {attempts["interrupted"], 1.0},
+		"attempts.success_rate": {attempts["success_rate"], 0.6667},
 		"provider.p50":          {provider["p50"], 30.0},
 		"provider.p95":          {provider["p95"], 808.0},
 		"e2e.p50":               {e2e["p50"], 2500.0},

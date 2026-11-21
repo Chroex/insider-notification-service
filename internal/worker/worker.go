@@ -80,7 +80,9 @@ type Observer interface {
 	// is committed.
 	NotificationSent(ch domain.Channel, endToEnd time.Duration)
 	NotificationFailed(ch domain.Channel, reason string)
-	LeasesReaped(requeued int, failedByChannel map[domain.Channel]int)
+	// LeasesReaped reports one reaper pass; interruptedByChannel counts the
+	// attempts it recorded as interrupted.
+	LeasesReaped(requeued int, failedByChannel, interruptedByChannel map[domain.Channel]int)
 	// BreakerStateChanged receives int(BreakerState): 0 closed, 1 open, 2 half-open.
 	BreakerStateChanged(ch domain.Channel, state int)
 }
@@ -91,7 +93,7 @@ type NopObserver struct{}
 func (NopObserver) AttemptFinished(domain.Channel, domain.AttemptOutcome, time.Duration) {}
 func (NopObserver) NotificationSent(domain.Channel, time.Duration)                       {}
 func (NopObserver) NotificationFailed(domain.Channel, string)                            {}
-func (NopObserver) LeasesReaped(int, map[domain.Channel]int)                             {}
+func (NopObserver) LeasesReaped(int, map[domain.Channel]int, map[domain.Channel]int)     {}
 func (NopObserver) BreakerStateChanged(domain.Channel, int)                              {}
 
 // persistTimeout bounds the DB write after a send. It uses a context that is
@@ -427,7 +429,7 @@ func (w *Worker) reaperLoop(ctx context.Context) {
 			w.log.Error("reaper failed", "error", err)
 		case res.Requeued > 0 || res.Failed > 0:
 			w.log.Warn("reaped expired leases", "requeued", res.Requeued, "failed", res.Failed)
-			w.cfg.Observer.LeasesReaped(res.Requeued, res.FailedByChannel)
+			w.cfg.Observer.LeasesReaped(res.Requeued, res.FailedByChannel, res.InterruptedByChannel)
 		}
 		select {
 		case <-ctx.Done():
@@ -442,7 +444,7 @@ func buildCompletion(job domain.Notification, res provider.Result, c Classificat
 
 	attempt := domain.DeliveryAttempt{
 		StartedAt:  start,
-		DurationMS: int(duration.Milliseconds()),
+		DurationMS: new(int(duration.Milliseconds())),
 		HTTPStatus: c.HTTPStatus,
 		Outcome:    c.Outcome,
 	}

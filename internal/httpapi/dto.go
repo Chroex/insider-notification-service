@@ -111,7 +111,7 @@ func toNotificationResponses(ns []domain.Notification) []notificationResponse {
 type attemptResponse struct {
 	AttemptNo  int       `json:"attempt_no"`
 	StartedAt  time.Time `json:"started_at"`
-	DurationMS int       `json:"duration_ms"`
+	DurationMS *int      `json:"duration_ms,omitempty"`
 	HTTPStatus *int      `json:"http_status,omitempty"`
 	Error      *string   `json:"error,omitempty"`
 	Outcome    string    `json:"outcome"`

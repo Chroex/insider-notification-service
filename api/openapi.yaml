@@ -630,16 +630,23 @@ components:
     DeliveryAttempt:
       type: object
       additionalProperties: false
-      required: [attempt_no, started_at, duration_ms, outcome]
+      required: [attempt_no, started_at, outcome]
       properties:
         attempt_no: { type: integer, minimum: 1 }
         started_at: { type: string, format: date-time }
-        duration_ms: { type: integer, minimum: 0 }
+        duration_ms:
+          type: integer
+          minimum: 0
+          description: Absent for an interrupted attempt (its duration is unknown).
         http_status: { type: integer, description: Absent for network errors and timeouts. }
         error: { type: string }
         outcome:
           type: string
-          enum: [success, retryable_error, permanent_error]
+          enum: [success, retryable_error, permanent_error, interrupted]
+          description: >
+            `interrupted` is written by the lease reaper when a worker crashed or
+            stalled during the call: the provider may or may not have received
+            the message. A late result from that worker replaces it.
 
     NotificationDetail:
       allOf:
@@ -722,12 +729,13 @@ components:
         attempts:
           type: object
           additionalProperties: false
-          required: [total, success, retryable_error, permanent_error, success_rate]
+          required: [total, success, retryable_error, permanent_error, interrupted, success_rate]
           properties:
             total: { type: integer }
             success: { type: integer }
             retryable_error: { type: integer }
             permanent_error: { type: integer }
+            interrupted: { type: integer, description: Calls lost to a worker crash or stall. }
             success_rate: { type: number, nullable: true }
         provider_latency_ms: { $ref: '#/components/schemas/Latency' }
         end_to_end_latency_ms:

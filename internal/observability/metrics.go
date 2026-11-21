@@ -98,7 +98,7 @@ func NewWorkerMetrics(reg prometheus.Registerer) *WorkerMetrics {
 		}, []string{"channel", "reason"}),
 		attempts: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "delivery_attempts_total",
-			Help: "Provider calls by outcome (success, retryable_error, permanent_error).",
+			Help: "Provider calls by outcome (success, retryable_error, permanent_error, interrupted).",
 		}, []string{"channel", "outcome"}),
 		deliveryLatency: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name: "delivery_latency_seconds",
@@ -150,11 +150,16 @@ func (m *WorkerMetrics) NotificationFailed(ch domain.Channel, reason string) {
 	m.failed.WithLabelValues(string(ch), reason).Inc()
 }
 
-func (m *WorkerMetrics) LeasesReaped(requeued int, failedByChannel map[domain.Channel]int) {
+func (m *WorkerMetrics) LeasesReaped(requeued int, failedByChannel, interruptedByChannel map[domain.Channel]int) {
 	m.leasesReaped.WithLabelValues("requeued").Add(float64(requeued))
 	for ch, n := range failedByChannel {
 		m.leasesReaped.WithLabelValues("failed").Add(float64(n))
 		m.failed.WithLabelValues(string(ch), "lease_expired").Add(float64(n))
+	}
+	// The lost call counts as an attempt, so delivery_attempts_total keeps
+	// matching the delivery_attempts table.
+	for ch, n := range interruptedByChannel {
+		m.attempts.WithLabelValues(string(ch), string(domain.OutcomeInterrupted)).Add(float64(n))
 	}
 }
 

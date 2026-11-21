@@ -40,6 +40,10 @@ const (
 	OutcomeSuccess        AttemptOutcome = "success"
 	OutcomeRetryableError AttemptOutcome = "retryable_error"
 	OutcomePermanentError AttemptOutcome = "permanent_error"
+	// OutcomeInterrupted is written by the reaper for an attempt whose
+	// worker died or stalled before recording a result: the provider may
+	// or may not have received the message.
+	OutcomeInterrupted AttemptOutcome = "interrupted"
 )
 
 // DeliveryAttempt records one provider call for the audit trail.
@@ -48,7 +52,7 @@ type DeliveryAttempt struct {
 	NotificationID uuid.UUID
 	AttemptNo      int
 	StartedAt      time.Time
-	DurationMS     int
+	DurationMS     *int // nil for an interrupted attempt: unknown
 	HTTPStatus     *int
 	Error          *string
 	Outcome        AttemptOutcome
