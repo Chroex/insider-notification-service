@@ -296,7 +296,7 @@ curl -i -X POST localhost:8080/api/v1/notifications \
 
 ```bash
 curl -X POST localhost:8080/api/v1/notifications -H 'Content-Type: application/json' \
-  -d '{"channel":"email","recipient":"user@example.com","content":"Weekly digest","scheduled_at":"2030-01-01T09:00:00Z"}'
+  -d '{"channel":"email","recipient":"user@example.com","content":"Weekly digest","scheduled_at":"2027-06-01T09:00:00Z"}'
 ```
 
 **Create a batch** (1-1000 items, all-or-nothing; invalid items are reported by `index`):
@@ -396,6 +396,7 @@ problem listed in one error.
 | `EMAIL_MAX_CHARS` | `10000` | api | Email content limit |
 | `PUSH_MAX_CHARS` | `256` | api | Push content limit |
 | `PUSH_TOKEN_MAX_CHARS` | `512` | api | Push device token limit |
+| `SCHEDULE_MAX_AHEAD` | `8760h` | api | How far ahead `scheduled_at` may be (365 days) |
 | `BATCH_MAX_SIZE` | `1000` | api | Items per batch request |
 | `MAX_ATTEMPTS` | `5` | api | Delivery attempts per notification (also the budget added by manual retry) |
 | `WORKER_CONCURRENCY` | `10` | worker | Parallel provider calls per channel |
@@ -531,7 +532,9 @@ Validation limits are configurable through environment variables:
 
 - Lengths count Unicode characters, not bytes. Real SMS encoding (GSM-7 160 vs
   UCS-2 70 characters per segment, multipart SMS) is future work.
-- `priority` defaults to `normal`. `scheduled_at` must be in the future.
+- `priority` defaults to `normal`. `scheduled_at` must be in the future and at
+  most 365 days ahead (`SCHEDULE_MAX_AHEAD`), so a typo like year 9999 is a 422
+  rather than a row that waits forever.
 - Text fields, template bodies and template variables must not contain the
   NUL character (U+0000). Postgres `text` and `jsonb` cannot store it, so it is
   rejected with a 422 instead of failing at insert time.

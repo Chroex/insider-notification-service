@@ -59,6 +59,8 @@ func TestValidate(t *testing.T) {
 		{"explicit priority ok", Request{Channel: "sms", Recipient: "+905551234567", Content: "hi", Priority: "low"}, nil},
 		{"scheduled in future ok", Request{Channel: "sms", Recipient: "+905551234567", Content: "hi", ScheduledAt: ptr(now.Add(time.Minute))}, nil},
 		{"scheduled in past", Request{Channel: "sms", Recipient: "+905551234567", Content: "hi", ScheduledAt: ptr(now.Add(-time.Minute))}, []string{"scheduled_at"}},
+		{"scheduled within a year ok", Request{Channel: "sms", Recipient: "+905551234567", Content: "hi", ScheduledAt: ptr(now.Add(364 * 24 * time.Hour))}, nil},
+		{"scheduled beyond a year", Request{Channel: "sms", Recipient: "+905551234567", Content: "hi", ScheduledAt: ptr(now.Add(366 * 24 * time.Hour))}, []string{"scheduled_at"}},
 		{"scheduled exactly now", Request{Channel: "sms", Recipient: "+905551234567", Content: "hi", ScheduledAt: ptr(now)}, []string{"scheduled_at"}},
 		{"NUL in content", Request{Channel: "sms", Recipient: "+905551234567", Content: "a\x00b"}, []string{"content"}},
 		{"NUL in push token", Request{Channel: "push", Recipient: "tok\x00en", Content: "hi"}, []string{"recipient"}},
@@ -101,5 +103,13 @@ func TestContainsNUL(t *testing.T) {
 				t.Errorf("ContainsNUL = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestValidate_ScheduleHorizonMessageIsReadable(t *testing.T) {
+	errs := DefaultRules.Validate(Request{Channel: "sms", Recipient: "+905551234567", Content: "hi",
+		ScheduledAt: ptr(now.Add(400 * 24 * time.Hour))}, now)
+	if len(errs) != 1 || errs[0].Message != "must be at most 365 days in the future" {
+		t.Errorf("errs = %+v", errs)
 	}
 }

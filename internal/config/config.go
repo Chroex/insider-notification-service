@@ -105,6 +105,7 @@ func Load(lookup LookupFunc) (Config, error) {
 			EmailMaxChars:     r.int("EMAIL_MAX_CHARS", validation.DefaultRules.EmailMaxChars),
 			PushMaxChars:      r.int("PUSH_MAX_CHARS", validation.DefaultRules.PushMaxChars),
 			PushTokenMaxChars: r.int("PUSH_TOKEN_MAX_CHARS", validation.DefaultRules.PushTokenMaxChars),
+			ScheduleMaxAhead:  r.duration("SCHEDULE_MAX_AHEAD", validation.DefaultRules.ScheduleMaxAhead),
 		},
 		BatchMaxSize: r.int("BATCH_MAX_SIZE", 1000),
 		MaxAttempts:  r.int("MAX_ATTEMPTS", 5),
@@ -145,6 +146,7 @@ func Load(lookup LookupFunc) (Config, error) {
 	r.require(cfg.Validation.SMSMaxChars > 0 && cfg.Validation.EmailMaxChars > 0 &&
 		cfg.Validation.PushMaxChars > 0 && cfg.Validation.PushTokenMaxChars > 0,
 		"*_MAX_CHARS limits must be positive")
+	r.require(cfg.Validation.ScheduleMaxAhead > 0, "SCHEDULE_MAX_AHEAD must be positive")
 	r.require(cfg.BatchMaxSize > 0, "BATCH_MAX_SIZE must be positive")
 	r.require(cfg.MaxAttempts > 0, "MAX_ATTEMPTS must be positive")
 

@@ -104,6 +104,21 @@ func TestLoad_RateLimit(t *testing.T) {
 	}
 }
 
+func TestLoad_ScheduleMaxAhead(t *testing.T) {
+	cfg, err := Load(lookupFrom(nil))
+	if err != nil || cfg.Validation.ScheduleMaxAhead != 365*24*time.Hour {
+		t.Errorf("default = %v, %v; want 8760h", cfg.Validation.ScheduleMaxAhead, err)
+	}
+	cfg, err = Load(lookupFrom(map[string]string{"SCHEDULE_MAX_AHEAD": "720h"}))
+	if err != nil || cfg.Validation.ScheduleMaxAhead != 720*time.Hour {
+		t.Errorf("override = %v, %v; want 720h", cfg.Validation.ScheduleMaxAhead, err)
+	}
+	if _, err := Load(lookupFrom(map[string]string{"SCHEDULE_MAX_AHEAD": "0s"})); err == nil ||
+		!strings.Contains(err.Error(), "SCHEDULE_MAX_AHEAD") {
+		t.Errorf("zero horizon err = %v", err)
+	}
+}
+
 func TestLoad_RejectsNonPositiveShutdownTimeout(t *testing.T) {
 	_, err := Load(lookupFrom(map[string]string{"SHUTDOWN_TIMEOUT": "0s"}))
 	if err == nil {

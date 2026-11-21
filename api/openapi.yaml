@@ -55,7 +55,7 @@ paths:
                 value: { channel: sms, recipient: '+905551234567', content: 'Your code is 482913', priority: high }
               scheduledEmail:
                 summary: Scheduled email
-                value: { channel: email, recipient: user@example.com, content: 'Weekly digest', scheduled_at: '2030-01-01T09:00:00Z' }
+                value: { channel: email, recipient: user@example.com, content: 'Weekly digest', scheduled_at: '2027-06-01T09:00:00Z' }
               fromTemplate:
                 summary: Rendered from a template
                 value:
@@ -575,7 +575,9 @@ components:
         scheduled_at:
           type: string
           format: date-time
-          description: Must be in the future. The notification stays `scheduled` until then.
+          description: >
+            Must be in the future and at most `SCHEDULE_MAX_AHEAD` (default 365
+            days) ahead. The notification stays `scheduled` until then.
 
     CreateBatchRequest:
       type: object

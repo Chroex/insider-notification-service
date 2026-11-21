@@ -22,6 +22,9 @@ type Rules struct {
 	EmailMaxChars     int
 	PushMaxChars      int
 	PushTokenMaxChars int
+	// ScheduleMaxAhead bounds scheduled_at, so a typo such as year 9999
+	// is rejected instead of sitting in the table forever.
+	ScheduleMaxAhead time.Duration
 }
 
 // DefaultRules mirror the documented assumptions.
@@ -30,6 +33,7 @@ var DefaultRules = Rules{
 	EmailMaxChars:     10_000,
 	PushMaxChars:      256,
 	PushTokenMaxChars: 512,
+	ScheduleMaxAhead:  365 * 24 * time.Hour,
 }
 
 // Request is the subset of a create request that validation inspects.
@@ -57,8 +61,13 @@ func (r Rules) Validate(req Request, now time.Time) []domain.FieldError {
 	if req.Priority != "" && !domain.Priority(req.Priority).Valid() {
 		add("priority", "must be one of high, normal, low")
 	}
-	if req.ScheduledAt != nil && !req.ScheduledAt.After(now) {
-		add("scheduled_at", "must be in the future")
+	if req.ScheduledAt != nil {
+		switch {
+		case !req.ScheduledAt.After(now):
+			add("scheduled_at", "must be in the future")
+		case req.ScheduledAt.After(now.Add(r.ScheduleMaxAhead)):
+			add("scheduled_at", "must be at most %s in the future", inDays(r.ScheduleMaxAhead))
+		}
 	}
 	if strings.TrimSpace(req.Content) == "" {
 		add("content", "is required")
@@ -102,6 +111,15 @@ func (r Rules) Validate(req Request, now time.Time) []domain.FieldError {
 		r.checkLength(&errs, req.Content, r.PushMaxChars)
 	}
 	return errs
+}
+
+// inDays prints whole days as "365 days" rather than "8760h0m0s".
+func inDays(d time.Duration) string {
+	const day = 24 * time.Hour
+	if d%day == 0 {
+		return fmt.Sprintf("%d days", d/day)
+	}
+	return d.String()
 }
 
 func (r Rules) checkLength(errs *[]domain.FieldError, content string, limit int) {
