@@ -536,6 +536,9 @@ Validation limits are configurable through environment variables:
   rejected with a 422 instead of failing at insert time.
 - A batch is all-or-nothing: one invalid item rejects the whole batch with a 422
   listing every failing index.
+- A request whose `Idempotency-Key` is already stored is answered with the
+  original resource (or a 409) *without* re-validation, so a retry still
+  succeeds after its `scheduled_at` has passed.
 - Idempotency keys are global (no multi-tenancy) and do not expire. Batches
   take a batch-level key; individual items in a batch do not.
 - A notification in `processing` cannot be cancelled: it may already be at the

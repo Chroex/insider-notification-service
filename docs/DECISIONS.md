@@ -311,6 +311,15 @@ not be silently swallowed.
   same hash → **200** with the original resource and `Idempotent-Replayed:
   true`; different hash → **409 `idempotency_conflict`**.
 - New resources return **201** with a `Location` header.
+- **A replay is answered before validation.** If the key already exists, the
+  stored row is returned (or 409) without re-validating the request. The
+  request was valid when first accepted; re-validating it later would turn a
+  successful create into a 422, e.g. a retry of a scheduled notification
+  after its `scheduled_at` has passed, or after a limit was lowered. The
+  client would then wrongly believe nothing was created. The hash is taken
+  from the request as sent (before template rendering) for the same reason.
+  The fast-path lookup is only an optimisation: the `ON CONFLICT` insert
+  still decides races. (Tested for single and batch creates.)
 
 **Alternatives.** SELECT-then-INSERT has a race: two concurrent retries both
 see "no row" and both insert. A Redis `SETNX` lock adds a second system that

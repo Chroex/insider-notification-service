@@ -344,6 +344,29 @@ func TestIdempotency_ReplayAndConflict(t *testing.T) {
 	}
 }
 
+// A replay must return the original even when the request would no longer
+// pass validation: here its scheduled_at is now in the past. A client
+// retrying after a timeout would otherwise get a 422 and wrongly conclude
+// the notification was never created.
+func TestIdempotency_ReplaySkipsValidation(t *testing.T) {
+	db.Reset(t)
+	body := sms("later")
+	body["scheduled_at"] = time.Now().Add(time.Second).UTC().Format(time.RFC3339Nano)
+	first := call(t, "POST", "/api/v1/notifications", body, "Idempotency-Key", "sched-1")
+	expectStatus(t, first, http.StatusCreated)
+
+	time.Sleep(1200 * time.Millisecond) // scheduled_at is now in the past
+	replay := call(t, "POST", "/api/v1/notifications", body, "Idempotency-Key", "sched-1")
+	expectStatus(t, replay, http.StatusOK)
+	if replay.Body["id"] != first.Body["id"] {
+		t.Errorf("replay id = %v, want %v", replay.Body["id"], first.Body["id"])
+	}
+
+	// A different payload under the same key is still a conflict, not a 422.
+	conflict := call(t, "POST", "/api/v1/notifications", sms(""), "Idempotency-Key", "sched-1")
+	expectStatus(t, conflict, http.StatusConflict)
+}
+
 func TestIdempotency_ConcurrentRequestsCreateOneRow(t *testing.T) {
 	db.Reset(t)
 	const clients = 20
@@ -612,6 +635,23 @@ func TestBatch_Idempotency(t *testing.T) {
 
 	if n := countRows(t, "SELECT count(*) FROM notifications"); n != 2 {
 		t.Errorf("rows = %d, want 2", n)
+	}
+}
+
+func TestBatch_IdempotentReplaySkipsValidation(t *testing.T) {
+	db.Reset(t)
+	later := sms("later")
+	later["scheduled_at"] = time.Now().Add(time.Second).UTC().Format(time.RFC3339Nano)
+	body := map[string]any{"notifications": []any{sms("now"), later}}
+	first := call(t, "POST", "/api/v1/notifications/batch", body, "Idempotency-Key", "campaign-8")
+	expectStatus(t, first, http.StatusCreated)
+
+	time.Sleep(1200 * time.Millisecond) // item 1's scheduled_at is now in the past
+	replay := call(t, "POST", "/api/v1/notifications/batch", body, "Idempotency-Key", "campaign-8")
+	expectStatus(t, replay, http.StatusOK)
+	if replay.Body["batch_id"] != first.Body["batch_id"] ||
+		fmt.Sprint(replay.Body["items"]) != fmt.Sprint(first.Body["items"]) {
+		t.Errorf("replay = %v, want the original batch and item ids in order: %v", replay.Body, first.Body)
 	}
 }
 

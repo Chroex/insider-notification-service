@@ -21,6 +21,20 @@ func scanBatch(row pgx.Row) (domain.Batch, error) {
 	return b, err
 }
 
+// GetBatchByIdempotencyKey returns domain.ErrNotFound when no batch was
+// created with key.
+func (s *Store) GetBatchByIdempotencyKey(ctx context.Context, key string) (domain.Batch, error) {
+	b, err := scanBatch(s.pool.QueryRow(ctx,
+		`SELECT `+batchColumns+` FROM batches WHERE idempotency_key = $1`, key))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.Batch{}, domain.ErrNotFound
+	}
+	if err != nil {
+		return domain.Batch{}, fmt.Errorf("load batch by idempotency key: %w", err)
+	}
+	return b, nil
+}
+
 // InsertBatch creates the batch row and all its notifications in one
 // transaction: either the whole batch is enqueued or none of it is.
 //

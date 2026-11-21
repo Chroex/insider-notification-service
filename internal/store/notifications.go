@@ -85,12 +85,25 @@ func (s *Store) InsertNotification(ctx context.Context, n domain.Notification) (
 		return domain.Notification{}, false, fmt.Errorf("insert notification: %w", err)
 	}
 
-	existing, err := ScanNotification(s.pool.QueryRow(ctx,
-		`SELECT `+NotificationColumns+` FROM notifications WHERE idempotency_key = $1`, *n.IdempotencyKey))
+	existing, err := s.GetNotificationByIdempotencyKey(ctx, *n.IdempotencyKey)
 	if err != nil {
-		return domain.Notification{}, false, fmt.Errorf("load notification by idempotency key: %w", err)
+		return domain.Notification{}, false, err
 	}
 	return existing, false, nil
+}
+
+// GetNotificationByIdempotencyKey returns domain.ErrNotFound when no
+// notification was created with key.
+func (s *Store) GetNotificationByIdempotencyKey(ctx context.Context, key string) (domain.Notification, error) {
+	n, err := ScanNotification(s.pool.QueryRow(ctx,
+		`SELECT `+NotificationColumns+` FROM notifications WHERE idempotency_key = $1`, key))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.Notification{}, domain.ErrNotFound
+	}
+	if err != nil {
+		return domain.Notification{}, fmt.Errorf("load notification by idempotency key: %w", err)
+	}
+	return n, nil
 }
 
 // GetNotification returns domain.ErrNotFound when id does not exist.

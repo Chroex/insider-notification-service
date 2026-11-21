@@ -6,6 +6,7 @@ package notification
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -21,12 +22,14 @@ import (
 // so tests can substitute a fake without touching Postgres.
 type Store interface {
 	InsertNotification(ctx context.Context, n domain.Notification) (domain.Notification, bool, error)
+	GetNotificationByIdempotencyKey(ctx context.Context, key string) (domain.Notification, error)
 	GetNotification(ctx context.Context, id uuid.UUID) (domain.Notification, error)
 	ListAttempts(ctx context.Context, id uuid.UUID) ([]domain.DeliveryAttempt, error)
 	ListNotifications(ctx context.Context, f store.ListFilter) ([]domain.Notification, *store.Cursor, error)
 	CancelNotification(ctx context.Context, id uuid.UUID) (domain.Notification, error)
 	RetryNotification(ctx context.Context, id uuid.UUID, extraAttempts int) (domain.Notification, error)
 	InsertBatch(ctx context.Context, b domain.Batch, items []domain.Notification) (domain.Batch, bool, error)
+	GetBatchByIdempotencyKey(ctx context.Context, key string) (domain.Batch, error)
 	GetBatchSummary(ctx context.Context, id uuid.UUID) (domain.BatchSummary, error)
 	ListBatchItems(ctx context.Context, batchID uuid.UUID, limit int, after *store.Cursor) ([]domain.Notification, *store.Cursor, error)
 	ListBatchItemIDs(ctx context.Context, batchID uuid.UUID) ([]uuid.UUID, error)
@@ -80,6 +83,22 @@ func (s *Service) Create(ctx context.Context, in CreateInput, idempotencyKey, co
 	if err != nil {
 		return domain.Notification{}, false, err
 	}
+	var hash string
+	if key != nil {
+		// Hash what the client sent, before validation renders templates.
+		hash = requestHash("notification", canonicalize(in))
+		existing, err := s.store.GetNotificationByIdempotencyKey(ctx, *key)
+		switch {
+		case err == nil: // replay: answered from what is stored, not re-validated
+			if err := checkReplay(existing.RequestHash, hash); err != nil {
+				return domain.Notification{}, false, err
+			}
+			return existing, false, nil
+		case !errors.Is(err, domain.ErrNotFound):
+			return domain.Notification{}, false, err
+		}
+	}
+
 	fieldErrs, err := s.validateInput(ctx, &in, templateCache{})
 	if err != nil {
 		return domain.Notification{}, false, err
@@ -91,7 +110,6 @@ func (s *Service) Create(ctx context.Context, in CreateInput, idempotencyKey, co
 	n = s.build(in, correlationID)
 	n.TraceParent = observability.TraceParent(ctx)
 	if key != nil {
-		hash := requestHash("notification", canonicalize(in))
 		n.IdempotencyKey, n.RequestHash = key, &hash
 	}
 
@@ -99,8 +117,8 @@ func (s *Service) Create(ctx context.Context, in CreateInput, idempotencyKey, co
 	if err != nil {
 		return domain.Notification{}, false, err
 	}
-	if !created {
-		if err := checkReplay(stored.RequestHash, *n.RequestHash); err != nil {
+	if !created { // a concurrent request with the same key won the insert
+		if err := checkReplay(stored.RequestHash, hash); err != nil {
 			return domain.Notification{}, false, err
 		}
 	}
@@ -148,6 +166,22 @@ func (s *Service) CreateBatch(ctx context.Context, items []CreateInput, idempote
 	if err != nil {
 		return BatchResult{}, false, err
 	}
+	var hash string
+	if key != nil {
+		// Hash what the client sent, before validation renders templates.
+		canonical := make([]canonicalItem, len(items))
+		for i, in := range items {
+			canonical[i] = canonicalize(in)
+		}
+		hash = requestHash("batch", canonical)
+		existing, err := s.store.GetBatchByIdempotencyKey(ctx, *key)
+		switch {
+		case err == nil: // replay: answered from what is stored, not re-validated
+			return s.replayBatch(ctx, existing, hash)
+		case !errors.Is(err, domain.ErrNotFound):
+			return BatchResult{}, false, err
+		}
+	}
 	if err := s.validateBatch(ctx, items); err != nil {
 		return BatchResult{}, false, err
 	}
@@ -163,11 +197,6 @@ func (s *Service) CreateBatch(ctx context.Context, items []CreateInput, idempote
 		ids[i] = rows[i].ID
 	}
 	if key != nil {
-		canonical := make([]canonicalItem, len(items))
-		for i, in := range items {
-			canonical[i] = canonicalize(in)
-		}
-		hash := requestHash("batch", canonical)
 		batch.IdempotencyKey, batch.RequestHash = key, &hash
 	}
 
@@ -178,8 +207,13 @@ func (s *Service) CreateBatch(ctx context.Context, items []CreateInput, idempote
 	if created {
 		return BatchResult{Batch: stored, IDs: ids}, true, nil
 	}
+	return s.replayBatch(ctx, stored, hash) // a concurrent request with the same key won
+}
 
-	if err := checkReplay(stored.RequestHash, *batch.RequestHash); err != nil {
+// replayBatch answers a repeated batch request with the original batch and
+// its item ids in request order, or a conflict if the payload differs.
+func (s *Service) replayBatch(ctx context.Context, stored domain.Batch, hash string) (BatchResult, bool, error) {
+	if err := checkReplay(stored.RequestHash, hash); err != nil {
 		return BatchResult{}, false, err
 	}
 	originalIDs, err := s.store.ListBatchItemIDs(ctx, stored.ID)

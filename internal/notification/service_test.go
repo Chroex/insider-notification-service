@@ -29,6 +29,13 @@ func (f *fakeStore) InsertNotification(_ context.Context, n domain.Notification)
 	return n, true, nil
 }
 
+func (f *fakeStore) GetNotificationByIdempotencyKey(_ context.Context, key string) (domain.Notification, error) {
+	if n, ok := f.byKey[key]; ok {
+		return n, nil
+	}
+	return domain.Notification{}, domain.ErrNotFound
+}
+
 func newTestService() (*Service, *fakeStore) {
 	fs := &fakeStore{byKey: map[string]domain.Notification{}}
 	svc := NewService(fs, Config{Rules: validation.DefaultRules, BatchMaxSize: 3, MaxAttempts: 5})
