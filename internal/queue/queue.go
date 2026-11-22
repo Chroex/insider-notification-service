@@ -34,8 +34,22 @@ func New(pool *pgxpool.Pool) *Queue {
 	return &Queue{pool: pool}
 }
 
-// Claim atomically takes up to limit due notifications for one channel and
-// leases them to the caller.
+// Quota says how many rows one claim may take and how they are shared
+// between priorities. Reserved[r] rows (r = priority rank: 0 high, 1 normal,
+// 2 low) are taken from that priority first, oldest due first. Whatever is
+// left of Total, including reserved slots a priority could not use, goes to
+// the rest of the due backlog in strict priority order. So no slots are
+// wasted, and with nothing reserved below high the claim is strict priority.
+type Quota struct {
+	Total    int
+	Reserved [3]int
+}
+
+// Strict is a quota of n rows in strict priority order.
+func Strict(n int) Quota { return Quota{Total: n} }
+
+// Claim atomically takes up to quota.Total due notifications for one channel
+// and leases them to the caller.
 //
 //   - FOR UPDATE SKIP LOCKED: concurrent workers skip rows another worker is
 //     claiming instead of blocking on them, so N workers claim N disjoint sets.
@@ -44,32 +58,55 @@ func New(pool *pgxpool.Pool) *Queue {
 //     never for the duration of a provider request.
 //   - attempts is incremented here, so each claim gets a unique attempt
 //     number. That number doubles as a fencing token for Complete/Release.
+//   - Each reserved part filters one priority_rank and orders by due time,
+//     so every part is an ordered scan of the claim index (no sort).
 //
 // The returned slice is ordered high priority first, then oldest due first.
-func (q *Queue) Claim(ctx context.Context, channel domain.Channel, limit int, lease time.Duration) ([]domain.Notification, error) {
+func (q *Queue) Claim(ctx context.Context, channel domain.Channel, quota Quota, lease time.Duration) ([]domain.Notification, error) {
+	// Reserved slots can never exceed the total (LIMIT must not go negative).
+	left := quota.Total
+	for r := range quota.Reserved {
+		quota.Reserved[r] = max(0, min(quota.Reserved[r], left))
+		left -= quota.Reserved[r]
+	}
+	const due = `
+			status IN ('scheduled', 'pending', 'retrying')
+			AND channel = $1
+			AND next_attempt_at <= now()
+			-- Never true for rows our own transitions produce. It keeps one
+			-- inconsistent row from failing the whole claim on the
+			-- attempts <= max_attempts constraint and blocking the channel.
+			AND attempts < max_attempts`
+	reserved := func(rank, limitParam int) string {
+		return fmt.Sprintf(`SELECT id FROM notifications
+			WHERE %s AND priority_rank = %d
+			ORDER BY next_attempt_at
+			LIMIT $%d
+			FOR UPDATE SKIP LOCKED`, due, rank, limitParam)
+	}
 	rows, err := q.pool.Query(ctx, `
-		WITH due AS (
-			SELECT id
-			FROM notifications
-			WHERE status IN ('scheduled', 'pending', 'retrying')
-			  AND channel = $1
-			  AND next_attempt_at <= now()
-			  -- Never true for rows our own transitions produce. It keeps one
-			  -- inconsistent row from failing the whole claim on the
-			  -- attempts <= max_attempts constraint and blocking the channel.
-			  AND attempts < max_attempts
+		WITH high AS (`+reserved(0, 3)+`),
+		normal AS (`+reserved(1, 4)+`),
+		low AS (`+reserved(2, 5)+`),
+		picked AS (
+			SELECT id FROM high UNION ALL SELECT id FROM normal UNION ALL SELECT id FROM low
+		),
+		-- Our own transaction already holds the picked rows' locks, so
+		-- SKIP LOCKED would not skip them: exclude them explicitly.
+		fill AS (
+			SELECT id FROM notifications
+			WHERE `+due+` AND id NOT IN (SELECT id FROM picked)
 			ORDER BY priority_rank, next_attempt_at
-			LIMIT $2
+			LIMIT $2 - (SELECT count(*) FROM picked)
 			FOR UPDATE SKIP LOCKED
 		)
 		UPDATE notifications n
 		SET status       = 'processing',
 		    attempts     = n.attempts + 1,
-		    locked_until = now() + $3 * interval '1 millisecond'
-		FROM due
-		WHERE n.id = due.id
+		    locked_until = now() + $6 * interval '1 millisecond'
+		WHERE n.id IN (SELECT id FROM picked UNION ALL SELECT id FROM fill)
 		RETURNING `+qualified("n", store.NotificationColumns),
-		channel, limit, lease.Milliseconds())
+		channel, quota.Total, quota.Reserved[0], quota.Reserved[1], quota.Reserved[2], lease.Milliseconds())
 	if err != nil {
 		return nil, fmt.Errorf("claim: %w", err)
 	}

@@ -226,11 +226,13 @@ Backoff handles brief blips; the breaker handles outages. Together they keep a
   (no spinning). Measured: 100.0 sends/s per channel end to end. If Redis is
   down, sending pauses rather than running unthrottled
   ([ADR-021](docs/DECISIONS.md#adr-021-distributed-rate-limiting-with-a-redis-token-bucket-lua)).
-- **Priority:** strict. Every due `high` goes before any `normal`, and every
-  `normal` before any `low`; FIFO within a priority. Served by a partial index
-  with no sort step (0.05 ms on 205k rows). Sustained `high` saturation can
-  starve `low`; the weighted-fair alternative is described in
-  [ADR-022](docs/DECISIONS.md#adr-022-strict-priority-ordering-and-how-to-avoid-starvation).
+- **Priority:** weighted, so nothing starves. While several priorities are
+  waiting, a channel's sends are shared 70/20/10 between `high`, `normal` and
+  `low` (`PRIORITY_WEIGHTS`); a priority with nothing due gives its share to
+  the others, so `high` gets everything when it is alone. FIFO within a
+  priority. Every part of the claim is an ordered index scan, no sort step.
+  `PRIORITY_WEIGHTS=100,0,0` gives strict priority
+  ([ADR-022](docs/DECISIONS.md#adr-022-priority-with-weighted-fair-sharing-so-low-is-never-starved)).
 
 ---
 
@@ -408,6 +410,7 @@ problem listed in one error.
 | `MAX_ATTEMPTS` | `5` | api | Delivery attempts per notification (also the budget added by manual retry) |
 | `WORKER_CONCURRENCY` | `10` | worker | Parallel provider calls per channel |
 | `CLAIM_BATCH_SIZE` | `10` | worker | Max rows per claim query |
+| `PRIORITY_WEIGHTS` | `70,20,10` | worker | Share of sends for high, normal, low while all wait (`100,0,0` = strict) |
 | `POLL_INTERVAL` | `500ms` | worker | Idle wait when nothing is due |
 | `LEASE_DURATION` | `30s` | worker | Claim lease (must be ≥ 2 x `PROVIDER_TIMEOUT`) |
 | `REAPER_INTERVAL` | `10s` | worker | How often expired leases are recovered |
@@ -429,7 +432,7 @@ problem listed in one error.
 | `MOCK_FAILURE_CODES` | `500,503,429` | mockprovider | Status codes picked for injected failures |
 | `MOCK_RETRY_AFTER` | `0s` | mockprovider | `Retry-After` sent with 429/503 (0 = none) |
 
-Compose passes `LOG_LEVEL`, `PROVIDER_URL` and the `MOCK_*` values through from
+Compose passes `LOG_LEVEL`, `PROVIDER_URL`, `PROVIDER_SUCCESS_STATUS` and the `MOCK_*` values through from
 your shell, e.g. `MOCK_FAILURE_RATE=0.5 docker compose up`.
 
 ---
@@ -461,7 +464,8 @@ fake provider, so they are deterministic. They cover:
 - 400 → `failed` after one attempt, never retried; exhaustion after `max_attempts`
 - cancel prevents sending; cancelling `sent`/`processing`/`failed` → 409; cancel vs. claim race
 - the same Idempotency-Key never creates a duplicate (including 20 concurrent requests)
-- high priority claimed and sent before older low priority
+- high priority claimed and sent before older low priority, and a flood of
+  high cannot starve low
 - the rate limiter caps two worker replicas near 100/s per channel
 - two concurrent workers never send the same notification twice (300 notifications)
 - crash recovery (reaper), stale workers can't overwrite newer claims, graceful shutdown
@@ -572,7 +576,8 @@ Validation limits are configurable through environment variables:
   present.
 - Rate limits are per channel and global across worker replicas. If Redis is
   down, sending pauses rather than running unthrottled.
-- Priority is strict (high, then normal, then low).
+- Priority is weighted (70/20/10 by default), not strict: during a flood of
+  `high`, `low` still gets its share.
 - Templates are immutable (no update endpoint) and are rendered when the
   notification is created; the stored `content` is the final text.
 - Delivery is **at-least-once**. Every request carries `X-Notification-ID` so
@@ -589,7 +594,9 @@ Validation limits are configurable through environment variables:
 - *Postgres as the queue:* transactional enqueue and simple operations, at the
   cost of a throughput ceiling of a few thousand messages/s per database.
   The path to Kafka (outbox + topics per channel) is in ADR-001.
-- *Strict priority* can starve `low` under sustained `high` load.
+- *Weighted priority:* during a flood `high` gets at least 70% of a channel,
+  not 100%, so an urgent message may wait slightly longer; in exchange every
+  message has a bounded wait (`PRIORITY_WEIGHTS=100,0,0` restores strict).
 - *Per-process circuit breakers:* each replica must see its own failures
   before it stops (bounded at `threshold + concurrency` calls each).
 - *Polling* (500ms when idle) instead of `LISTEN/NOTIFY` adds up to 0.5s of

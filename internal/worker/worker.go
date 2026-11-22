@@ -22,7 +22,7 @@ import (
 // Queue is the subset of queue.Queue the worker needs (an interface so the
 // dispatch loop can be unit tested without Postgres).
 type Queue interface {
-	Claim(ctx context.Context, channel domain.Channel, limit int, lease time.Duration) ([]domain.Notification, error)
+	Claim(ctx context.Context, channel domain.Channel, quota queue.Quota, lease time.Duration) ([]domain.Notification, error)
 	Renew(ctx context.Context, id uuid.UUID, attempt int, lease time.Duration) (bool, error)
 	Complete(ctx context.Context, c queue.Completion) error
 	Release(ctx context.Context, jobs []domain.Notification) (int64, error)
@@ -59,6 +59,11 @@ type Config struct {
 	ReaperInterval  time.Duration
 	ShutdownTimeout time.Duration
 	Policy          RetryPolicy
+
+	// PriorityWeights share each channel's sends between high, normal and
+	// low when all are waiting (e.g. 70/20/10), so low is never starved.
+	// Zero for normal and low means strict priority. See fairShare.
+	PriorityWeights [3]int
 
 	// Circuit breaker per channel (see Breaker).
 	BreakerThreshold int
@@ -202,6 +207,7 @@ func (w *Worker) claimLoop(ctx, sendCtx context.Context, ch domain.Channel, infl
 	log := w.log.With(observability.KeyChannel, ch)
 	slots := make(chan struct{}, w.cfg.Concurrency)
 	breaker := w.breakers[ch]
+	share := newFairShare(w.cfg.PriorityWeights)
 
 	for {
 		permits, wait, gen := breaker.Permits()
@@ -241,7 +247,7 @@ func (w *Worker) claimLoop(ctx, sendCtx context.Context, ch domain.Channel, infl
 		}
 		releaseSlots(slots, n-tokens)
 
-		jobs, err := w.queue.Claim(ctx, ch, tokens, w.cfg.LeaseDuration)
+		jobs, err := w.queue.Claim(ctx, ch, share.quota(tokens), w.cfg.LeaseDuration)
 		unused := tokens - len(jobs)
 		releaseSlots(slots, unused)
 		w.refund(log, ch, unused)

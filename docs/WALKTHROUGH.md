@@ -44,7 +44,8 @@ and OpenTelemetry traces.
    ([ratelimit/limiter.go](../internal/ratelimit/limiter.go), a Lua script),
    then claim up to that many due rows.
 6. **Claim** ([queue/queue.go](../internal/queue/queue.go)): one statement
-   selects due rows ordered by priority with `FOR UPDATE SKIP LOCKED` and sets
+   takes due rows by priority share (70/20/10, so low is never starved) with
+   `FOR UPDATE SKIP LOCKED` and sets
    `status = 'processing'`, `attempts + 1`, `locked_until = now() + 30s`. It
    commits before any HTTP call.
 7. **Send** `process` → [provider/client.go](../internal/provider/client.go):

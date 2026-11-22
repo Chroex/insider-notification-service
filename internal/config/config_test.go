@@ -28,6 +28,9 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.LogLevel != slog.LevelInfo {
 		t.Errorf("LogLevel = %v, want info", cfg.LogLevel)
 	}
+	if cfg.Worker.PriorityWeights != [3]int{70, 20, 10} {
+		t.Errorf("PriorityWeights = %v, want [70 20 10]", cfg.Worker.PriorityWeights)
+	}
 	if cfg.ProviderSuccessStatus != 202 {
 		t.Errorf("ProviderSuccessStatus = %d, want 202 (the brief's provider contract)", cfg.ProviderSuccessStatus)
 	}
@@ -79,6 +82,9 @@ func TestLoad_WorkerInvariants(t *testing.T) {
 		{"shutdown not longer than provider timeout", map[string]string{"SHUTDOWN_TIMEOUT": "5s", "PROVIDER_TIMEOUT": "5s"}, "SHUTDOWN_TIMEOUT"},
 		{"zero concurrency", map[string]string{"WORKER_CONCURRENCY": "0"}, "WORKER_CONCURRENCY"},
 		{"success status not 2xx", map[string]string{"PROVIDER_SUCCESS_STATUS": "302"}, "PROVIDER_SUCCESS_STATUS"},
+		{"two priority weights", map[string]string{"PRIORITY_WEIGHTS": "70,30"}, "PRIORITY_WEIGHTS"},
+		{"negative priority weight", map[string]string{"PRIORITY_WEIGHTS": "70,40,-10"}, "PRIORITY_WEIGHTS"},
+		{"no weight for high", map[string]string{"PRIORITY_WEIGHTS": "0,50,50"}, "PRIORITY_WEIGHTS"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -157,5 +163,16 @@ func TestLoadMockProvider(t *testing.T) {
 				t.Errorf("error = %v, want mention of %s", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+// "100,0,0" switches fair sharing off: strict priority.
+func TestLoad_PriorityWeightsOverride(t *testing.T) {
+	cfg, err := Load(lookupFrom(map[string]string{"PRIORITY_WEIGHTS": " 100, 0 ,0"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Worker.PriorityWeights != [3]int{100, 0, 0} {
+		t.Errorf("PriorityWeights = %v", cfg.Worker.PriorityWeights)
 	}
 }

@@ -106,6 +106,7 @@ func run() error {
 			BreakerThreshold: cfg.Worker.BreakerThreshold,
 			BreakerWindow:    cfg.Worker.BreakerWindow,
 			BreakerCooldown:  cfg.Worker.BreakerCooldown,
+			PriorityWeights:  cfg.Worker.PriorityWeights,
 			Observer:         metrics,
 			Events:           events.NewRedisPublisher(rdb, log),
 		},

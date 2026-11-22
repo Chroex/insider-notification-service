@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -63,6 +64,29 @@ func (r *envReader) duration(key string, def time.Duration) time.Duration {
 		return def
 	}
 	return v
+}
+
+// weights reads three comma-separated non-negative integers ("70,20,10").
+func (r *envReader) weights(key string, def [3]int) [3]int {
+	raw, ok := r.lookup(key)
+	if !ok || raw == "" {
+		return def
+	}
+	parts := strings.Split(raw, ",")
+	var out [3]int
+	if len(parts) != len(out) {
+		r.errs = append(r.errs, fmt.Errorf("%s: %q must be three comma-separated integers, e.g. 70,20,10", key, raw))
+		return def
+	}
+	for i, p := range parts {
+		v, err := strconv.Atoi(strings.TrimSpace(p))
+		if err != nil || v < 0 {
+			r.errs = append(r.errs, fmt.Errorf("%s: %q must be three non-negative integers, e.g. 70,20,10", key, raw))
+			return def
+		}
+		out[i] = v
+	}
+	return out
 }
 
 // require records an error when a cross-field or range rule is violated.

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -478,8 +479,8 @@ func TestDelivery_TwoWorkersNeverSendTheSameNotificationTwice(t *testing.T) {
 // another worker claimed it (attempts moved on, row still processing).
 type stalledQueue struct{ *queue.Queue }
 
-func (q stalledQueue) Claim(ctx context.Context, ch domain.Channel, limit int, lease time.Duration) ([]domain.Notification, error) {
-	jobs, err := q.Queue.Claim(ctx, ch, limit, lease)
+func (q stalledQueue) Claim(ctx context.Context, ch domain.Channel, quota queue.Quota, lease time.Duration) ([]domain.Notification, error) {
+	jobs, err := q.Queue.Claim(ctx, ch, quota, lease)
 	for _, j := range jobs {
 		if _, err := db.Pool.Exec(ctx, `UPDATE notifications
 			SET attempts = attempts + 1, locked_until = now() + interval '1 minute' WHERE id = $1`, j.ID); err != nil {
@@ -623,14 +624,14 @@ func TestQueue_StaleWorkerCannotOverwriteNewerClaim(t *testing.T) {
 	q := queue.New(db.Pool)
 	n := insertNotification(t, domain.ChannelSMS)
 
-	first, err := q.Claim(ctx, domain.ChannelSMS, 1, -time.Second) // lease already expired
+	first, err := q.Claim(ctx, domain.ChannelSMS, queue.Strict(1), -time.Second) // lease already expired
 	if err != nil || len(first) != 1 {
 		t.Fatalf("claim = %v, %v", first, err)
 	}
 	if _, err := q.ReapExpired(ctx); err != nil {
 		t.Fatal(err)
 	}
-	second, err := q.Claim(ctx, domain.ChannelSMS, 1, time.Minute)
+	second, err := q.Claim(ctx, domain.ChannelSMS, queue.Strict(1), time.Minute)
 	if err != nil || len(second) != 1 || second[0].Attempts != 2 {
 		t.Fatalf("re-claim = %+v, %v", second, err)
 	}
@@ -688,7 +689,7 @@ func TestQueue_ClaimSkipsRowsWithNoBudgetLeft(t *testing.T) {
 	}
 	healthy := insertNotification(t, domain.ChannelSMS)
 
-	jobs, err := queue.New(db.Pool).Claim(ctx, domain.ChannelSMS, 10, time.Minute)
+	jobs, err := queue.New(db.Pool).Claim(ctx, domain.ChannelSMS, queue.Strict(10), time.Minute)
 	if err != nil || len(jobs) != 1 || jobs[0].ID != healthy.ID {
 		t.Fatalf("claim = %+v, %v; want only the row with budget left", jobs, err)
 	}
@@ -700,7 +701,7 @@ func TestQueue_ReleaseRefundsTheAttempt(t *testing.T) {
 	q := queue.New(db.Pool)
 	n := insertNotification(t, domain.ChannelEmail, func(x *domain.Notification) { x.Recipient = "u@example.com" })
 
-	jobs, err := q.Claim(ctx, domain.ChannelEmail, 1, time.Minute)
+	jobs, err := q.Claim(ctx, domain.ChannelEmail, queue.Strict(1), time.Minute)
 	if err != nil || len(jobs) != 1 {
 		t.Fatalf("claim = %v, %v", jobs, err)
 	}
@@ -718,7 +719,7 @@ func TestQueue_ClaimIsPerChannel(t *testing.T) {
 	db.Reset(t)
 	ctx := context.Background()
 	insertNotification(t, domain.ChannelSMS)
-	jobs, err := queue.New(db.Pool).Claim(ctx, domain.ChannelPush, 10, time.Minute)
+	jobs, err := queue.New(db.Pool).Claim(ctx, domain.ChannelPush, queue.Strict(10), time.Minute)
 	if err != nil || len(jobs) != 0 {
 		t.Errorf("push claim returned %d sms jobs (err %v)", len(jobs), err)
 	}
@@ -775,7 +776,7 @@ func TestPriority_ClaimOrderIsStrict(t *testing.T) {
 	}
 
 	for _, p := range []domain.Priority{domain.PriorityHigh, domain.PriorityNormal, domain.PriorityLow} {
-		jobs, err := q.Claim(ctx, domain.ChannelSMS, 3, time.Minute)
+		jobs, err := q.Claim(ctx, domain.ChannelSMS, queue.Strict(3), time.Minute)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -784,6 +785,70 @@ func TestPriority_ClaimOrderIsStrict(t *testing.T) {
 				t.Errorf("claim for %s returned a %s notification", p, j.Priority)
 			}
 		}
+	}
+}
+
+// Reserved shares are taken per priority, oldest first; whatever a priority
+// cannot use goes to the rest of the backlog in priority order.
+func TestQueue_ClaimTakesReservedSharesThenFillsByPriority(t *testing.T) {
+	db.Reset(t)
+	ctx := context.Background()
+	q := queue.New(db.Pool)
+	var lows []uuid.UUID
+	for range 5 {
+		lows = append(lows, insertNotification(t, domain.ChannelSMS, withPriority(domain.PriorityLow)).ID)
+	}
+	for range 5 {
+		insertNotification(t, domain.ChannelSMS, withPriority(domain.PriorityHigh))
+	}
+
+	// 4 slots: 2 reserved for high, 1 for normal (none due), 1 for low.
+	jobs, err := q.Claim(ctx, domain.ChannelSMS, queue.Quota{Total: 4, Reserved: [3]int{2, 1, 1}}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := map[domain.Priority]int{}
+	for _, j := range jobs {
+		count[j.Priority]++
+	}
+	// normal's unused slot is filled by the highest priority due: high.
+	if len(jobs) != 4 || count[domain.PriorityHigh] != 3 || count[domain.PriorityLow] != 1 {
+		t.Errorf("claimed %d jobs: %v; want 3 high and 1 low", len(jobs), count)
+	}
+	if jobs[len(jobs)-1].ID != lows[0] {
+		t.Error("the reserved low slot did not take the oldest low")
+	}
+
+	// Reserved slots beyond what a priority has also spill over.
+	jobs, err = q.Claim(ctx, domain.ChannelSMS, queue.Quota{Total: 6, Reserved: [3]int{0, 0, 6}}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 6 || jobs[0].Priority != domain.PriorityHigh || jobs[1].Priority != domain.PriorityHigh {
+		t.Errorf("got %d jobs; want the 2 remaining highs plus the 4 remaining lows", len(jobs))
+	}
+}
+
+// A flood of high priority must not starve low: with the default 70/20/10
+// weights a waiting low is sent within the first few sends even though
+// dozens of highs are due ahead of it.
+func TestPriority_LowIsNotStarvedByAHighFlood(t *testing.T) {
+	db.Reset(t)
+	fp := newFakeProvider(t, always(http.StatusAccepted))
+	low := insertNotification(t, domain.ChannelSMS, withPriority(domain.PriorityLow))
+	for range 30 {
+		insertNotification(t, domain.ChannelSMS, withPriority(domain.PriorityHigh))
+	}
+
+	cfg := testConfig()
+	cfg.Concurrency, cfg.ClaimBatchSize = 1, 1
+	cfg.PriorityWeights = [3]int{70, 20, 10}
+	startWorker(t, fp.URL, cfg)
+	waitForStatus(t, low.ID, domain.StatusSent, 10*time.Second)
+
+	pos := slices.Index(fp.order(), low.ID.String())
+	if pos < 0 || pos >= 10 {
+		t.Errorf("low was send #%d; want it within the first 10 despite 30 highs", pos+1)
 	}
 }
 
@@ -1133,7 +1198,7 @@ func TestQueue_DueTimesUseTheDatabaseClock(t *testing.T) {
 	n := insertNotification(t, domain.ChannelSMS, func(x *domain.Notification) {
 		x.NextAttemptAt = time.Now().Add(time.Hour)
 	})
-	jobs, err := q.Claim(ctx, domain.ChannelSMS, 1, time.Minute)
+	jobs, err := q.Claim(ctx, domain.ChannelSMS, queue.Strict(1), time.Minute)
 	if err != nil || len(jobs) != 1 || jobs[0].ID != n.ID {
 		t.Fatalf("immediate notification not claimable with a fast app clock: %v, %v", jobs, err)
 	}
@@ -1145,7 +1210,7 @@ func TestQueue_DueTimesUseTheDatabaseClock(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if jobs, err := q.Claim(ctx, domain.ChannelSMS, 1, time.Minute); err != nil || len(jobs) != 1 {
+	if jobs, err := q.Claim(ctx, domain.ChannelSMS, queue.Strict(1), time.Minute); err != nil || len(jobs) != 1 {
 		t.Fatalf("zero-delay retry not claimable: %v, %v", jobs, err)
 	}
 
@@ -1157,7 +1222,7 @@ func TestQueue_DueTimesUseTheDatabaseClock(t *testing.T) {
 	if _, _, err := store.New(db.Pool).InsertBatch(ctx, b, []domain.Notification{row}); err != nil {
 		t.Fatal(err)
 	}
-	if jobs, err := q.Claim(ctx, domain.ChannelPush, 1, time.Minute); err != nil || len(jobs) != 1 {
+	if jobs, err := q.Claim(ctx, domain.ChannelPush, queue.Strict(1), time.Minute); err != nil || len(jobs) != 1 {
 		t.Fatalf("batch row not claimable with a fast app clock: %v, %v", jobs, err)
 	}
 }

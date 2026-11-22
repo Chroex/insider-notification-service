@@ -7,7 +7,8 @@ info:
 
     The API validates and **enqueues** notifications; it never calls the
     provider itself. Workers deliver them asynchronously with per-channel rate
-    limiting (100 msg/s by default), strict priority, retries with exponential
+    limiting (100 msg/s by default), weighted priority (high/normal/low share
+    70/20/10, so low is never starved), retries with exponential
     backoff + jitter, and a circuit breaker.
 
     **Conventions**

@@ -26,7 +26,7 @@ Entries are added as the system is built; later entries may refine earlier ones.
 | [ADR-019](#adr-019-error-classification-and-attempt-accounting) | Error classification and attempt accounting |
 | [ADR-020](#adr-020-graceful-shutdown) | Graceful shutdown |
 | [ADR-021](#adr-021-distributed-rate-limiting-with-a-redis-token-bucket-lua) | Distributed rate limiting with a Redis token bucket (Lua) |
-| [ADR-022](#adr-022-strict-priority-ordering-and-how-to-avoid-starvation) | Strict priority ordering (and how to avoid starvation) |
+| [ADR-022](#adr-022-priority-with-weighted-fair-sharing-so-low-is-never-starved) | Priority with weighted fair sharing, so low is never starved |
 | [ADR-023](#adr-023-exponential-backoff-with-full-jitter-honouring-retry-after) | Exponential backoff with full jitter, honouring Retry-After |
 | [ADR-024](#adr-024-circuit-breaker-per-channel) | Circuit breaker per channel |
 | [ADR-025](#adr-025-failed-notifications-are-the-dead-letter-set-manual-retry) | Failed notifications are the dead-letter set; manual retry |
@@ -663,38 +663,56 @@ replica by a few milliseconds.
 
 ---
 
-## ADR-022: Strict priority ordering (and how to avoid starvation)
+## ADR-022: Priority with weighted fair sharing, so low is never starved
 
-**Decision.** The claim query orders by `priority_rank, next_attempt_at`:
-every due `high` notification on a channel goes before any `normal`, every
-`normal` before any `low`. Within a priority it is FIFO by due time. Rate
-limiting makes this matter: during a flash-sale burst the channel is capped at
-100/s, and strict priority decides *which* 100 go first (OTPs and
-transactional messages before marketing).
+**Context.** The brief asks for priority support (high, normal, low) and
+nothing more specific. Rate limiting is what makes priority matter: during a
+flash-sale burst a channel is capped at 100/s, and priority decides *which*
+100 go first (OTPs and transactional messages before marketing). The first
+version used strict priority: every due `high` before any `normal`, every
+`normal` before any `low`. Under sustained `high` traffic that starves `low`
+forever, and nothing in the brief asks for that.
 
-**Evidence that it is cheap.** `EXPLAIN ANALYZE` on 205k rows (200k sent,
-5k pending): an index scan on the partial `notifications_claim_idx` with no
-Sort node (the index supplies the order), 0.05 ms. The index is 240 kB, against
-18 MB for the full list index, because it only holds the backlog (ADR-004).
+**Decision.** Each channel shares its sends between priorities by weight,
+`PRIORITY_WEIGHTS=70,20,10` by default, while more than one priority is
+waiting.
+- The worker plans every claim with *smooth weighted round robin* (the
+  algorithm nginx uses for upstream weights): each slot goes to the priority
+  with the most credit, which then pays the sum of the weights. Over any 10
+  slots that is exactly 7 high, 2 normal, 1 low, interleaved, and the credit
+  carries across claims, so the share holds when a saturated worker claims one
+  row at a time (`worker/fairshare.go`).
+- The claim takes each priority's reserved slots from that priority, oldest
+  due first, and gives every slot a priority could not use (nothing due) to
+  the rest of the backlog in strict order (`queue.Quota`). Reserved slots are
+  a floor, not a cap: with only `high` traffic, `high` gets everything; when
+  the queue is short, the order is the same as strict priority.
+- `100,0,0` switches sharing off (strict priority).
 
-**Trade-off: starvation.** If `high` traffic alone saturates a channel's rate
-limit for a long time, `low` notifications are never claimed. For Insider
-One's mix (bursts, not sustained saturation) that is acceptable and is the
-behaviour product teams usually expect: marketing waits, OTPs don't.
+**Evidence.**
+- Each reserved part filters one `priority_rank` and orders by due time, so it
+  is an ordered scan of the partial `notifications_claim_idx` with no Sort
+  node (`EXPLAIN`: Index Scan → LockRows → Limit). The strict version measured
+  0.05 ms on 205k rows; the shared claim runs four such scans.
+- `TestPriority_LowIsNotStarvedByAHighFlood`: one `low` behind 30 due `high`
+  is sent within the first 10 sends; with `100,0,0` it is send #31.
+- `TestFairShare_*`: 70/20/10 over 100 slots in claims of 1, 3 and 10.
 
-**Alternatives if starvation becomes real.**
-1. *Weighted fair claiming:* each claim cycle splits its tokens across
-   priorities by weight (e.g. 70/20/10) with one `priority_rank = $x` claim
-   per priority, giving unused share to the others. Keeps index-ordered
-   claims and guarantees `low` a minimum share.
-2. *Aging:* treat a row as one priority higher for every N minutes it has
-   waited. Easy to express in SQL, but the computed sort key can no longer be
-   served by the index, so every claim sorts the whole backlog.
-3. *Separate queues/topics per priority* in a Kafka design (ADR-001), with
-   consumer quotas per topic.
+**Alternatives.**
+1. *Strict priority* (the first version): simplest, but starves `low`.
+2. *Aging* (a row moves up one priority for every N minutes it waits): the
+   sort key changes with time, so the index cannot supply the order and every
+   claim sorts the whole due backlog, which is exactly when the backlog is
+   large.
+3. *Separate queues/topics per priority* with consumer quotas, in a Kafka
+   design (ADR-001).
 
-Option 1 is the natural next step here: a small change in the claim loop and
-no schema change.
+**Consequences.** During a flood, `high` gets at least 70% of the channel,
+not 100%: an OTP may wait a little longer while marketing still moves. That
+is the trade for a bounded wait for every message. The weights are per
+replica; with several worker replicas the shares hold on average. The
+weights are one setting, so a product team that wants strict priority back
+can have it.
 
 ---
 

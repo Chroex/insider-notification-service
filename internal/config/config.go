@@ -87,6 +87,11 @@ type Worker struct {
 	BreakerWindow    time.Duration
 	BreakerCooldown  time.Duration
 
+	// PriorityWeights share a channel's sends between high, normal and low
+	// while all three are waiting, so low is never starved (ADR-022).
+	// "100,0,0" means strict priority.
+	PriorityWeights [3]int
+
 	// QueueDepthInterval is how often the queue_depth gauge is refreshed.
 	QueueDepthInterval time.Duration
 }
@@ -127,6 +132,7 @@ func Load(lookup LookupFunc) (Config, error) {
 			BreakerThreshold: r.int("BREAKER_FAILURE_THRESHOLD", 5),
 			BreakerWindow:    r.duration("BREAKER_FAILURE_WINDOW", time.Minute),
 			BreakerCooldown:  r.duration("BREAKER_COOLDOWN", 30*time.Second),
+			PriorityWeights:  r.weights("PRIORITY_WEIGHTS", [3]int{70, 20, 10}),
 
 			QueueDepthInterval: r.duration("QUEUE_DEPTH_INTERVAL", 15*time.Second),
 		},
@@ -170,6 +176,7 @@ func Load(lookup LookupFunc) (Config, error) {
 	r.require(w.RetryMaxDelay >= w.RetryBaseDelay, "RETRY_MAX_DELAY must be >= RETRY_BASE_DELAY")
 	r.require(w.BreakerThreshold >= 1 && w.BreakerCooldown > 0 && w.BreakerWindow > 0,
 		"BREAKER_FAILURE_THRESHOLD must be >= 1, BREAKER_FAILURE_WINDOW and BREAKER_COOLDOWN positive")
+	r.require(w.PriorityWeights[0] > 0, "PRIORITY_WEIGHTS: high's weight must be positive")
 	for ch, rate := range cfg.RateLimit.PerSecond {
 		r.require(rate > 0, "RATE_LIMIT_%s_PER_SECOND must be positive", strings.ToUpper(ch))
 	}
