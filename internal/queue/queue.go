@@ -34,6 +34,9 @@ func New(pool *pgxpool.Pool) *Queue {
 	return &Queue{pool: pool}
 }
 
+// claimTimeout bounds one claim statement (normally milliseconds).
+const claimTimeout = 5 * time.Second
+
 // Quota says how many rows one claim may take and how they are shared
 // between priorities. Reserved[r] rows (r = priority rank: 0 high, 1 normal,
 // 2 low) are taken from that priority first, oldest due first. Whatever is
@@ -63,6 +66,14 @@ func Strict(n int) Quota { return Quota{Total: n} }
 //
 // The returned slice is ordered high priority first, then oldest due first.
 func (q *Queue) Claim(ctx context.Context, channel domain.Channel, quota Quota, lease time.Duration) ([]domain.Notification, error) {
+	// A claim must not be abandoned halfway: the UPDATE commits on the
+	// server even if we stop waiting for its rows, and rows we never receive
+	// stay 'processing' with no owner until their lease runs out (then the
+	// reaper charges them an attempt they never made). So shutdown does not
+	// cancel a claim; it runs to completion, bounded by claimTimeout, and the
+	// caller hands back what it got (found by the failure-hunter agent).
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), claimTimeout)
+	defer cancel()
 	// Reserved slots can never exceed the total (LIMIT must not go negative).
 	left := quota.Total
 	for r := range quota.Reserved {

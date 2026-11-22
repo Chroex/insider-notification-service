@@ -497,8 +497,15 @@ recorded. An empty claim sleeps `POLL_INTERVAL` (500ms) before trying again.
   slow provider) a longer wait would let the lease run out and the row be
   sent by two workers (found by the failure-hunter agent, round 2). After
   half the lease the row is handed back unsent, attempt refunded, and
-  claimed again later. After the wait the worker re-checks the breaker and
-  ownership (`Renew`, which also extends the lease for the send).
+  claimed again later. After the wait the worker re-checks ownership
+  (`Renew`, which also extends the lease for the send) and, immediately
+  before the call, the breaker.
+- **A claim is not cancellable.** Its `UPDATE ... RETURNING` commits on the
+  server even if the caller stops waiting for the rows, which would leave
+  them `processing` with no owner until the lease ran out (and the reaper
+  would then charge an attempt never made). So shutdown does not cancel a
+  claim: it finishes (bounded by 5s) and the worker hands back what it got
+  (found by the failure-hunter agent; tested with 300 cancelled claims).
 - **Per-channel loops** isolate channels: a slow SMS provider cannot starve
   email sends.
 
@@ -534,7 +541,8 @@ it.
   implementation; integration-tested with a queue that simulates the stall.)
 - **The lost call is in the history** (migration 000009). The reaper writes
   the crashed claim's attempt as `outcome = 'interrupted'`, started at the
-  claim (the row's `updated_at`) with no duration, because it is unknown.
+  last write the worker made (the row's `updated_at`: the claim or the
+  pre-send `Renew`), with no duration, because it is unknown.
   Without it, `GET /notifications/{id}` would skip an attempt number and hide
   the one fact support needs: *this message may already have been
   delivered*. If the stalled worker reports later, its real result replaces
@@ -547,7 +555,11 @@ it.
 
 **Consequence: at-least-once delivery.** If a worker dies after the provider
 accepted a message but before the result was committed, the reaper re-queues
-the row and it is sent again. Verified manually: `kill -9` with 8 sends in
+the row and it is sent again. A failed result write alone is not enough for
+that: the worker retries it with backoff for up to 5s (safe, because a
+failed transaction leaves nothing and the write is fenced on the attempt
+number), so one dropped database connection after a 202 does not turn into
+a duplicate (found by the failure-hunter agent, round 3). Verified manually: `kill -9` with 8 sends in
 flight → all 8 re-queued after the lease and delivered again (twice in total).
 At-most-once (mark sent *before* calling) would silently lose messages
 instead, which is worse for OTPs and order updates.
@@ -672,9 +684,15 @@ stall: busiest second 100; 228 before these fixes). The script reads **Redis's c
 **Where it sits in the worker.** The claim is sized by free send slots
 (ADR-017); the slot is taken in `process`, immediately before the HTTP call,
 and marked done when the call returns with an answer. The wait is bounded by
-half the lease, and the breaker and row ownership are checked again after
-it (ADR-017, ADR-024). A slot taken but not used (the breaker opened, the
-row was lost) is marked done at once, so it frees a second later. Keys
+half the lease; after it, row ownership (`Renew`) and, right before the
+call, the breaker are checked again (ADR-017, ADR-024). A slot taken but not
+used (the breaker opened, the row was lost) is marked done at once, so it
+frees a second later. The max send time a slot is held for without an
+answer covers everything after the grant: the ownership check (up to 5s),
+the status publish (up to 0.5s) and the provider call, plus a second
+(`worker.SlotHold`); a slow ownership check could otherwise let the entry
+expire before the request even left (found by the failure-hunter agent,
+round 3). Keys
 expire once every entry could have left the window, but a replica never
 shortens a TTL another replica set (replicas may disagree on
 `PROVIDER_TIMEOUT` during a rolling change).
@@ -845,8 +863,8 @@ half_open --(probe fails)----------> open (cooldown restarts)
   with their attempt budget intact (tested: 7 of 10 untouched at
   `attempts = 0`). A job already claimed when the breaker trips is released
   before sending, with its attempt refunded, including a job that was
-  waiting for a rate-limit slot when it tripped (checked again after the
-  wait). The claim loop sleeps for the
+  waiting for a rate-limit slot when it tripped (checked again immediately
+  before the call). The claim loop sleeps for the
   remaining cooldown instead of polling.
 - **Half-open allows exactly one probe** across the channel's claim loop. If no
   row is due, the probe permit is returned, so the next iteration can try again.

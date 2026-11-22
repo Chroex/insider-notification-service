@@ -46,10 +46,11 @@ and OpenTelemetry traces.
    `FOR UPDATE SKIP LOCKED` and sets
    `status = 'processing'`, `attempts + 1`, `locked_until = now() + 30s`. It
    commits before any HTTP call.
-7. **Send** `process`: confirm the row is still ours (`Renew`), take a
-   rate-limit slot from Redis
-   ([ratelimit/limiter.go](../internal/ratelimit/limiter.go), a Lua script),
-   then call [provider/client.go](../internal/provider/client.go):
+7. **Send** `process`: take a rate-limit slot from Redis
+   ([ratelimit/limiter.go](../internal/ratelimit/limiter.go), a Lua script;
+   the wait is capped at half the lease), confirm the row is still ours
+   (`Renew`), check the breaker one last time, then call
+   [provider/client.go](../internal/provider/client.go):
    `POST {to, channel, content}` with `X-Notification-ID` and
    `X-Correlation-ID`, 5 s timeout, redirects never followed.
 8. **Decide** ([worker/classify.go](../internal/worker/classify.go),
@@ -139,6 +140,7 @@ and each fix has a test that failed first.
 | The sliding window counted grants taken before the claim: a refund could remove another replica's entries, and the provider saw up to 160 sends in a second | The failure-hunter agent, measuring arrivals at a fake provider | Take the slot right before each call and hold it until one second after the call returns (ADR-021) |
 | A misconfigured provider answering 200 would drain the whole backlog to `failed`, because permanent errors reset the breaker | The interviewer agent | A 2xx other than 202 counts against the provider in the breaker (ADR-019) |
 | Second round against the new limiter: a job waiting for a slot sent after the breaker opened; a wait longer than the lease let two workers send one row (up to 5 times); timed-out requests freed their slots early (a stalled provider saw 228 in a second); a replica with a shorter timeout shortened the key's TTL | The failure-hunter agent, round 2 | Re-check breaker and ownership after the wait, bound the wait by half the lease, keep an unanswered request's slot for the max send time, never shorten a TTL (ADR-017, ADR-021) |
+| Third round: a slow ownership check after the rate-limit grant let the slot expire before the send; the breaker could open during that check; a claim cancelled by shutdown left committed rows with no owner; one transient DB error after a 202 caused a duplicate send | The failure-hunter agent, round 3 | The slot hold covers everything after the grant; the breaker is checked right before the call; claims are not cancellable; the result write is retried (ADR-017, ADR-018, ADR-021) |
 | A half-open probe dropped before its send (a failed ownership check) wedged the channel until restart | The failure-hunter agent | Every early exit hands the probe back, tied to its breaker period (ADR-024) |
 | Seven stale lines in README, DECISIONS and code comments (strict priority, old claim SQL, a "future work" item already done) | The pdf-auditor and interviewer agents | Corrected; the 70/20/10 docs now say spare capacity goes by priority (ADR-022) |
 | "Flaky" link errors | Investigating test failures | The disk was full: an environment problem, not code |

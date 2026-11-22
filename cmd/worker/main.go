@@ -89,9 +89,10 @@ func run() error {
 	engine := worker.New(
 		queue.New(db),
 		provider.NewClient(cfg.ProviderURL, cfg.Worker.ProviderTimeout, cfg.ProviderSuccessStatus),
-		// A slot is reclaimed after the longest possible send even if the
-		// worker dies before reporting it finished.
-		ratelimit.New(rdb, limits, "").WithMaxSend(cfg.Worker.ProviderTimeout+time.Second),
+		// A slot is reclaimed after the longest possible send (ownership
+		// check, status publish and provider call) even if the worker dies
+		// before reporting it finished.
+		ratelimit.New(rdb, limits, "").WithMaxSend(worker.SlotHold(cfg.Worker.ProviderTimeout)),
 		worker.Config{
 			Channels:        domain.Channels,
 			Concurrency:     cfg.Worker.Concurrency,

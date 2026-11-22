@@ -109,6 +109,19 @@ func (NopObserver) BreakerStateChanged(domain.Channel, int)                     
 // result would cause a needless duplicate send after the lease expires.
 const persistTimeout = 5 * time.Second
 
+// publishTimeout bounds the "processing" status event; it matches the
+// timeout events.Publish applies itself.
+const publishTimeout = 500 * time.Millisecond
+
+// SlotHold is how long a rate-limit slot must stay counted when its send
+// never reports back: everything between the grant and the end of the call
+// (the ownership check, the status publish, the provider call itself) plus
+// a second of margin. cmd/worker passes it to ratelimit.WithMaxSend. An
+// answered call releases its slot sooner (one second after the answer).
+func SlotHold(providerTimeout time.Duration) time.Duration {
+	return persistTimeout + publishTimeout + providerTimeout + time.Second
+}
+
 type Worker struct {
 	queue    Queue
 	sender   Sender
@@ -310,14 +323,9 @@ func (w *Worker) process(stopCtx, sendCtx context.Context, job domain.Notificati
 			sendDone() // not sent after all: free the slot a second from now
 		}
 	}()
-	// The wait can be long, so check again what may have changed during it:
-	// the breaker may have opened, and the lease may have run out and the
-	// row been claimed by another worker. Renew also extends the lease for
-	// the send itself.
-	if !breaker.Current(gen) {
-		w.release(log, job, "released job: circuit breaker opened while waiting for a rate-limit slot")
-		return
-	}
+	// The wait can be long, so check that the row is still ours: the lease
+	// may have run out and the row been claimed by another worker. Renew
+	// also extends the lease for the send itself.
 	if !w.stillOwned(sendCtx, log, job) {
 		return
 	}
@@ -333,6 +341,13 @@ func (w *Worker) process(stopCtx, sendCtx context.Context, job domain.Notificati
 	}
 
 	w.cfg.Events.Publish(sendCtx, events.FromNotification(job, w.now())) // status: processing
+
+	// Last look at the breaker, immediately before the call: it may have
+	// opened during the wait, the ownership check or the publish.
+	if !breaker.Current(gen) {
+		w.release(log, job, "released job: circuit breaker opened before the send")
+		return
+	}
 
 	start := w.now()
 	res, sendErr := w.sender.Send(sendCtx, provider.Message{
@@ -362,17 +377,7 @@ func (w *Worker) process(stopCtx, sendCtx context.Context, job domain.Notificati
 	completion := buildCompletion(job, res, c, decision, start, duration)
 	recordAttemptOnSpan(span, c, decision)
 
-	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(sendCtx), persistTimeout)
-	defer cancel()
-	if err := w.queue.Complete(persistCtx, completion); err != nil {
-		if errors.Is(err, queue.ErrLeaseLost) {
-			log.Warn("lease lost before result was recorded; another worker owns the notification",
-				"outcome", c.Outcome)
-			return
-		}
-		// The row stays 'processing' until its lease expires; the reaper
-		// will re-queue it (at-least-once).
-		log.Error("failed to record attempt", "error", err, "outcome", c.Outcome)
+	if err := w.complete(sendCtx, log, completion, c.Outcome); err != nil {
 		return
 	}
 
@@ -432,6 +437,42 @@ func (w *Worker) observeDecision(job domain.Notification, d Decision) {
 		w.cfg.Observer.NotificationSent(job.Channel, now.Sub(job.CreatedAt), now.Sub(due))
 	case domain.StatusFailed:
 		w.cfg.Observer.NotificationFailed(job.Channel, d.FailReason)
+	}
+}
+
+// complete records the attempt's result, retrying a failed write for up to
+// persistTimeout. Losing a result after the provider accepted the message
+// would mean a duplicate send once the lease runs out (the reaper re-queues
+// the row), so one dropped connection must not be enough (found by the
+// failure-hunter agent). Retrying is safe: a failed transaction leaves no
+// attempt row, and the write is fenced on the attempt number, so if an
+// earlier try did commit, the retry gets ErrLeaseLost and changes nothing.
+func (w *Worker) complete(sendCtx context.Context, log *slog.Logger, completion queue.Completion, outcome domain.AttemptOutcome) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(sendCtx), persistTimeout)
+	defer cancel()
+	delay := 50 * time.Millisecond
+	for try := 1; ; try++ {
+		err := w.queue.Complete(ctx, completion)
+		switch {
+		case err == nil:
+			return nil
+		case errors.Is(err, queue.ErrLeaseLost) && try > 1:
+			log.Warn("result not recorded by the retry: an earlier try committed it, or another worker owns the row",
+				"outcome", outcome)
+			return err
+		case errors.Is(err, queue.ErrLeaseLost):
+			log.Warn("lease lost before result was recorded; another worker owns the notification",
+				"outcome", outcome)
+			return err
+		}
+		log.Warn("failed to record attempt, retrying", "error", err, "try", try, "outcome", outcome)
+		if sleep(ctx, delay); ctx.Err() != nil {
+			// Out of time: the row stays 'processing' until its lease
+			// expires, then the reaper re-queues it (at-least-once).
+			log.Error("failed to record attempt", "error", err, "outcome", outcome)
+			return err
+		}
+		delay = min(2*delay, time.Second)
 	}
 }
 
