@@ -123,6 +123,11 @@ and each fix has a test that failed first.
 | A retried scheduled request got a 422 after its time passed | Comparing with another implementation | Answer replays before validation (ADR-011) |
 | `{{printf "%099999999d" 1}}` in a template could allocate ~100 MB | Probing the API | Templates allow only variables and `if` (ADR-028) |
 | A 25-digit `Retry-After` was ignored | Reading the parser | Saturate instead of overflow |
+| A 1000-item template batch allocated ~374 MB before being rejected | Code review | Rendering stops at the channel's limit (ADR-028) |
+| A repeat that added `variables` to a plain request replayed it (200, not 409) | Debate with the Codex version | The request hash always includes `variables` (ADR-011) |
+| With a short cooldown, an old send's success closed the breaker before the probe answered | Debate with the Codex version | Results belong to the breaker period they started in (ADR-024) |
+| A worker stalled past its lease could still send a row another worker had claimed | Debate with the Codex version | Re-check ownership right before the send (ADR-018) |
+| End-to-end latency left out the scheduled wait, unlike the brief's definition | Debate with the Codex version | Created → sent, plus a separate due → sent metric (ADR-026) |
 | "Flaky" link errors | Investigating test failures | The disk was full: an environment problem, not code |
 
 ## A five-minute demo
