@@ -328,7 +328,7 @@ func (q *Queue) ReapExpired(ctx context.Context) (ReapResult, error) {
 }
 
 // qualified prefixes each column with alias ("id, status" -> "n.id, n.status").
-// RETURNING needs it here because the CTE "due" also has an id column.
+// RETURNING needs it here because the claim's CTEs also have an id column.
 func qualified(alias, columns string) string {
 	parts := strings.Split(columns, ",")
 	for i, col := range parts {

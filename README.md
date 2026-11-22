@@ -233,9 +233,11 @@ Backoff handles brief blips; the breaker handles outages. Together they keep a
   ([ADR-021](docs/DECISIONS.md#adr-021-distributed-rate-limiting-with-a-redis-sliding-window-of-sends-lua)).
 - **Priority:** weighted, so nothing starves. While several priorities are
   waiting, a channel's sends are shared 70/20/10 between `high`, `normal` and
-  `low` (`PRIORITY_WEIGHTS`); a priority with nothing due gives its share to
-  the others, so `high` gets everything when it is alone. FIFO within a
-  priority. Every part of the claim is an ordered index scan, no sort step.
+  `low` (`PRIORITY_WEIGHTS`). The weights are a guaranteed minimum, not a
+  cap: a share a priority cannot use goes to the highest priority that has
+  work. So `high` alone gets everything, and with only `normal` and `low`
+  waiting the split is 90/10 (normal keeps its 20 and takes high's 70), not
+  67/33. FIFO within a priority. Every part of the claim is an ordered index scan, no sort step.
   `PRIORITY_WEIGHTS=100,0,0` gives strict priority
   ([ADR-022](docs/DECISIONS.md#adr-022-priority-with-weighted-fair-sharing-so-low-is-never-starved)).
 
@@ -611,7 +613,6 @@ Validation limits are configurable through environment variables:
 
 **Future work**
 
-- Weighted-fair priority (e.g. 70/20/10) to bound starvation.
 - Multipart SMS with GSM-7/UCS-2 segment counting.
 - Per-tenant API keys, rate limits and idempotency scopes; expiring idempotency keys.
 - Bulk dead-letter redrive (`retry` by batch or error type).

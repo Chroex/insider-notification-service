@@ -24,8 +24,9 @@ func (c Channel) Valid() bool {
 	return false
 }
 
-// Priority controls claim order. Ordering is strict: high before normal
-// before low (see docs/DECISIONS.md for the starvation trade-off).
+// Priority controls claim order. While several priorities wait, a channel's
+// sends are shared by weight (70/20/10 by default, so low is never starved);
+// spare capacity goes to the highest priority (docs/DECISIONS.md, ADR-022).
 type Priority string
 
 const (

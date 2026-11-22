@@ -600,9 +600,6 @@ instead, which is worse for OTPs and order updates.
 - `Retry-After` (seconds or HTTP-date) is honoured when it asks for longer than
   our own delay.
 
-Phase 3 uses a fixed `RETRY_BASE_DELAY`; exponential backoff with jitter
-replaces it later behind the same `RetryPolicy.Decide` call.
-
 ---
 
 ## ADR-020: Graceful shutdown
@@ -729,7 +726,11 @@ waiting.
   due first, and gives every slot a priority could not use (nothing due) to
   the rest of the backlog in strict order (`queue.Quota`). Reserved slots are
   a floor, not a cap: with only `high` traffic, `high` gets everything; when
-  the queue is short, the order is the same as strict priority.
+  the queue is short, the order is the same as strict priority. Because the
+  unused share goes by priority, not by weight, `normal` and `low` alone
+  split 90/10, not 67/33: `normal` keeps its 20 and takes `high`'s 70. That
+  is deliberate: every priority has a guaranteed minimum, and spare capacity
+  favours the more important messages.
 - `100,0,0` switches sharing off (strict priority).
 
 **Evidence.**
