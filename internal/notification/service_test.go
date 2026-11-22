@@ -108,6 +108,22 @@ func TestCreate_Idempotency(t *testing.T) {
 	}
 }
 
+// Review finding (Codex comparison): a repeat that adds variables to a
+// plain-content request is a different request, so it is a conflict, not
+// a replay of the original.
+func TestCreate_ExtraVariablesUnderSameKeyIsConflict(t *testing.T) {
+	svc, _ := newTestService()
+	ctx := context.Background()
+	if _, _, err := svc.Create(ctx, validSMS, "key-2", "c"); err != nil {
+		t.Fatal(err)
+	}
+	withVars := validSMS
+	withVars.Variables = map[string]any{"name": "Ayşe"}
+	if _, _, err := svc.Create(ctx, withVars, "key-2", "c"); !errors.Is(err, domain.ErrIdempotencyConflict) {
+		t.Errorf("err = %v, want ErrIdempotencyConflict", err)
+	}
+}
+
 func TestCreateBatch_ReportsEveryFailingIndex(t *testing.T) {
 	svc, _ := newTestService()
 	items := []CreateInput{validSMS, {Channel: "sms", Recipient: "bad", Content: "x"}, {Channel: "fax", Content: "x"}}

@@ -639,6 +639,20 @@ func TestBatch_Idempotency(t *testing.T) {
 	}
 }
 
+// A repeat that adds variables to a plain-content item is a different
+// request under the same key: 409, not a replay.
+func TestBatch_ExtraVariablesUnderSameKeyIsConflict(t *testing.T) {
+	db.Reset(t)
+	body := map[string]any{"notifications": []any{sms("a")}}
+	expectStatus(t, call(t, "POST", "/api/v1/notifications/batch", body, "Idempotency-Key", "campaign-9"), http.StatusCreated)
+
+	withVars := sms("a")
+	withVars["variables"] = map[string]any{"name": "x"}
+	r := call(t, "POST", "/api/v1/notifications/batch",
+		map[string]any{"notifications": []any{withVars}}, "Idempotency-Key", "campaign-9")
+	expectStatus(t, r, http.StatusConflict)
+}
+
 func TestBatch_IdempotentReplaySkipsValidation(t *testing.T) {
 	db.Reset(t)
 	later := sms("later")

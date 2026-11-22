@@ -34,6 +34,10 @@ func canonicalize(in CreateInput) canonicalItem {
 		Recipient: in.Recipient,
 		Content:   in.Content,
 		Priority:  string(EffectivePriority(in.Priority)),
+		// Always hashed, template or not: replays are answered before
+		// validation, so a repeat that adds variables to a plain request
+		// must still differ from the original (409), not replay it.
+		Variables: in.Variables,
 	}
 	if in.ScheduledAt != nil {
 		// UTC + fixed format: "2030-01-01T03:00:00+03:00" and
@@ -43,7 +47,7 @@ func canonicalize(in CreateInput) canonicalItem {
 	}
 	if in.TemplateID != nil {
 		id := in.TemplateID.String()
-		c.TemplateID, c.Variables = &id, in.Variables
+		c.TemplateID = &id
 	}
 	return c
 }
