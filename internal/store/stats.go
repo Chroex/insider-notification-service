@@ -107,16 +107,16 @@ func (s *Store) Summary(ctx context.Context, since time.Time) (Summary, error) {
 			return rows.Err()
 		}},
 		{"sent", func() error {
-			// End-to-end runs from when the notification became due:
-			// scheduled_at for scheduled sends (the wait was intended),
-			// created_at otherwise.
+			// End-to-end runs from creation to sent, as the brief defines
+			// it (scheduled waits included); the worker's
+			// due_to_sent_seconds metric shows the delay after becoming due.
 			rows, err := s.pool.Query(ctx, `
 				SELECT channel, count(*),
-				       percentile_cont(0.50) WITHIN GROUP (ORDER BY due_ms),
-				       percentile_cont(0.95) WITHIN GROUP (ORDER BY due_ms)
+				       percentile_cont(0.50) WITHIN GROUP (ORDER BY e2e_ms),
+				       percentile_cont(0.95) WITHIN GROUP (ORDER BY e2e_ms)
 				FROM (
 					SELECT channel,
-					       extract(epoch FROM sent_at - GREATEST(created_at, COALESCE(scheduled_at, created_at))) * 1000 AS due_ms
+					       extract(epoch FROM sent_at - created_at) * 1000 AS e2e_ms
 					FROM notifications
 					WHERE status = 'sent' AND sent_at >= $1
 				) s

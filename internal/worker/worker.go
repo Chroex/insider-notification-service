@@ -80,7 +80,9 @@ type Observer interface {
 	AttemptFinished(ch domain.Channel, outcome domain.AttemptOutcome, providerLatency time.Duration)
 	// NotificationSent / NotificationFailed are called once the new status
 	// is committed.
-	NotificationSent(ch domain.Channel, endToEnd time.Duration)
+	// endToEnd is created -> sent (the brief's definition); sinceDue starts
+	// at scheduled_at for scheduled sends, so it shows only our delay.
+	NotificationSent(ch domain.Channel, endToEnd, sinceDue time.Duration)
 	NotificationFailed(ch domain.Channel, reason string)
 	// LeasesReaped reports one reaper pass; interruptedByChannel counts the
 	// attempts it recorded as interrupted.
@@ -93,7 +95,7 @@ type Observer interface {
 type NopObserver struct{}
 
 func (NopObserver) AttemptFinished(domain.Channel, domain.AttemptOutcome, time.Duration) {}
-func (NopObserver) NotificationSent(domain.Channel, time.Duration)                       {}
+func (NopObserver) NotificationSent(domain.Channel, time.Duration, time.Duration)        {}
 func (NopObserver) NotificationFailed(domain.Channel, string)                            {}
 func (NopObserver) LeasesReaped(int, map[domain.Channel]int, map[domain.Channel]int)     {}
 func (NopObserver) BreakerStateChanged(domain.Channel, int)                              {}
@@ -388,13 +390,15 @@ func (w *Worker) publishDecision(ctx context.Context, job domain.Notification, d
 func (w *Worker) observeDecision(job domain.Notification, d Decision) {
 	switch d.Status {
 	case domain.StatusSent:
-		// Measured from when the notification became due, so a send
-		// scheduled for tomorrow doesn't look like a day of latency.
+		// End-to-end is created -> sent, as the brief defines it. The
+		// delay since becoming due is reported too, so a send scheduled
+		// for tomorrow doesn't hide a slow queue behind a day of waiting.
+		now := w.now()
 		due := job.CreatedAt
 		if job.ScheduledAt != nil && job.ScheduledAt.After(due) {
 			due = *job.ScheduledAt
 		}
-		w.cfg.Observer.NotificationSent(job.Channel, w.now().Sub(due))
+		w.cfg.Observer.NotificationSent(job.Channel, now.Sub(job.CreatedAt), now.Sub(due))
 	case domain.StatusFailed:
 		w.cfg.Observer.NotificationFailed(job.Channel, d.FailReason)
 	}

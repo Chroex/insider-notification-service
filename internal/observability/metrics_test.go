@@ -34,7 +34,7 @@ func TestWorkerMetrics_Events(t *testing.T) {
 	m := NewWorkerMetrics(prometheus.NewRegistry())
 	m.AttemptFinished(domain.ChannelSMS, domain.OutcomeSuccess, 30*time.Millisecond)
 	m.AttemptFinished(domain.ChannelSMS, domain.OutcomeRetryableError, 10*time.Millisecond)
-	m.NotificationSent(domain.ChannelSMS, 2*time.Second)
+	m.NotificationSent(domain.ChannelSMS, 3*time.Second, 2*time.Second)
 	m.NotificationFailed(domain.ChannelEmail, "permanent_error")
 	m.LeasesReaped(2, map[domain.Channel]int{domain.ChannelPush: 1}, map[domain.Channel]int{domain.ChannelPush: 3})
 	m.BreakerStateChanged(domain.ChannelEmail, 1)

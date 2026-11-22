@@ -836,7 +836,8 @@ error type) for after a provider outage or a fixed configuration bug.
 | `notifications_failed_total` | counter | channel, reason (`permanent_error`, `max_attempts`, `lease_expired`) | worker |
 | `delivery_attempts_total` | counter | channel, outcome | worker |
 | `delivery_latency_seconds` | histogram | channel | worker (one provider call) |
-| `end_to_end_latency_seconds` | histogram | channel | worker (due → sent) |
+| `end_to_end_latency_seconds` | histogram | channel | worker (created → sent) |
+| `due_to_sent_seconds` | histogram | channel | worker (due → sent: our own delay) |
 | `queue_depth` | gauge | channel, priority, status | worker, refreshed from Postgres |
 | `circuit_breaker_state` | gauge (0/1/2) | channel | worker |
 | `leases_reaped_total` | counter | result | worker |
@@ -852,9 +853,13 @@ Design choices:
 - **The engine reports through a small `worker.Observer` interface** defined
   next to the code that uses it, so the worker has no Prometheus dependency and
   tests can plug in fakes.
-- **End-to-end latency is measured from when the notification became due**
-  (`scheduled_at` if later than `created_at`), so a send scheduled for tomorrow
-  doesn't look like a day of latency.
+- **Two latencies for scheduled sends.** `end_to_end_latency_seconds` and the
+  summary's `end_to_end_latency_ms` run from creation to sent, as the brief
+  defines them, so a scheduled wait is included. `due_to_sent_seconds` starts
+  at `scheduled_at` when that is later, so a send scheduled for tomorrow
+  doesn't hide a slow queue behind a day of intended waiting. (An earlier
+  version measured end-to-end from the due time; the Codex comparison pointed
+  out that this departs from the brief's definition.)
 - **`queue_depth` comes from Postgres** (`GROUP BY channel, priority, status`
   over non-terminal rows, every 15s), because the database is the only place
   that knows the true backlog. Every replica exports the same value, so

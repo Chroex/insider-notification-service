@@ -920,6 +920,25 @@ func TestMetricsSummary(t *testing.T) {
 	}
 }
 
+// end_to_end_latency_ms is created -> sent, matching the Prometheus metric
+// and the brief: a scheduled notification's wait is included.
+func TestMetricsSummary_EndToEndIsCreatedToSent(t *testing.T) {
+	db.Reset(t)
+	if _, err := db.Pool.Exec(context.Background(), `
+		INSERT INTO notifications (correlation_id, channel, recipient, content, status, attempts,
+			created_at, scheduled_at, sent_at, next_attempt_at)
+		VALUES ('c', 'sms', 'r', 'x', 'sent', 1, now() - interval '10 seconds',
+			now() - interval '9 seconds', now(), now())`); err != nil {
+		t.Fatal(err)
+	}
+	r := call(t, "GET", "/api/v1/metrics/summary?window=1h", nil)
+	expectStatus(t, r, http.StatusOK)
+	p50, _ := r.Body["overall"].(map[string]any)["end_to_end_latency_ms"].(map[string]any)["p50"].(float64)
+	if p50 < 9500 {
+		t.Errorf("end_to_end p50 = %.0f ms, want ~10000 (created -> sent, including the scheduled wait)", p50)
+	}
+}
+
 // --- templates ---
 
 func createTemplate(t *testing.T, name, channel, body string) string {

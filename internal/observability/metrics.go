@@ -81,6 +81,7 @@ type WorkerMetrics struct {
 	attempts        *prometheus.CounterVec
 	deliveryLatency *prometheus.HistogramVec
 	endToEnd        *prometheus.HistogramVec
+	dueToSent       *prometheus.HistogramVec
 	queueDepth      *prometheus.GaugeVec
 	breakerState    *prometheus.GaugeVec
 	leasesReaped    *prometheus.CounterVec
@@ -108,7 +109,12 @@ func NewWorkerMetrics(reg prometheus.Registerer) *WorkerMetrics {
 		}, []string{"channel"}),
 		endToEnd: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "end_to_end_latency_seconds",
-			Help:    "Time from a notification becoming due (created, or scheduled_at) to being sent.",
+			Help:    "Time from a notification being created to being sent (includes any scheduled wait).",
+			Buckets: []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 300, 900, 3600},
+		}, []string{"channel"}),
+		dueToSent: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "due_to_sent_seconds",
+			Help:    "Time from a notification becoming due (created, or scheduled_at) to being sent: our own delay.",
 			Buckets: []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 300, 900, 3600},
 		}, []string{"channel"}),
 		queueDepth: prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -125,7 +131,7 @@ func NewWorkerMetrics(reg prometheus.Registerer) *WorkerMetrics {
 			Help: "Expired leases recovered by the reaper (requeued or failed).",
 		}, []string{"result"}),
 	}
-	reg.MustRegister(m.sent, m.failed, m.attempts, m.deliveryLatency, m.endToEnd,
+	reg.MustRegister(m.sent, m.failed, m.attempts, m.deliveryLatency, m.endToEnd, m.dueToSent,
 		m.queueDepth, m.breakerState, m.leasesReaped)
 
 	// Pre-create series so dashboards and alerts see 0 instead of "no data".
@@ -141,9 +147,10 @@ func (m *WorkerMetrics) AttemptFinished(ch domain.Channel, outcome domain.Attemp
 	m.deliveryLatency.WithLabelValues(string(ch)).Observe(providerLatency.Seconds())
 }
 
-func (m *WorkerMetrics) NotificationSent(ch domain.Channel, endToEnd time.Duration) {
+func (m *WorkerMetrics) NotificationSent(ch domain.Channel, endToEnd, sinceDue time.Duration) {
 	m.sent.WithLabelValues(string(ch)).Inc()
 	m.endToEnd.WithLabelValues(string(ch)).Observe(endToEnd.Seconds())
+	m.dueToSent.WithLabelValues(string(ch)).Observe(sinceDue.Seconds())
 }
 
 func (m *WorkerMetrics) NotificationFailed(ch domain.Channel, reason string) {

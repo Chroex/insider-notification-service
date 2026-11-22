@@ -745,7 +745,7 @@ components:
         provider_latency_ms: { $ref: '#/components/schemas/Latency' }
         end_to_end_latency_ms:
           allOf: [{ $ref: '#/components/schemas/Latency' }]
-          description: From becoming due (created, or scheduled_at) to sent.
+          description: From creation to sent, including any scheduled wait.
 
     Summary:
       type: object

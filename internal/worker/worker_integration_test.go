@@ -949,6 +949,44 @@ notifications_sent_total{channel="sms"} 2
 	}
 }
 
+// The brief defines end_to_end_latency_seconds as created -> sent, so a
+// scheduled notification's intended wait counts; due_to_sent_seconds
+// measures only the delay after it became due.
+func TestMetrics_EndToEndIsCreatedToSent(t *testing.T) {
+	db.Reset(t)
+	fp := newFakeProvider(t, always(http.StatusAccepted))
+	n := insertNotification(t, domain.ChannelPush, scheduledAt(time.Now().Add(400*time.Millisecond)))
+
+	reg := prometheus.NewRegistry()
+	cfg := testConfig()
+	cfg.Observer = observability.NewWorkerMetrics(reg)
+	startWorker(t, fp.URL, cfg)
+	waitForStatus(t, n.ID, domain.StatusSent, 5*time.Second)
+
+	if sum := histogramSum(t, reg, "end_to_end_latency_seconds"); sum < 0.4 {
+		t.Errorf("end_to_end_latency_seconds sum = %.3fs, want >= 0.4s (created -> sent)", sum)
+	}
+	if sum := histogramSum(t, reg, "due_to_sent_seconds"); sum <= 0 || sum >= 0.4 {
+		t.Errorf("due_to_sent_seconds sum = %.3fs, want the delay after scheduled_at only", sum)
+	}
+}
+
+// histogramSum returns the sample sum of the first series of a histogram,
+// or -1 if the metric does not exist.
+func histogramSum(t *testing.T, reg *prometheus.Registry, name string) float64 {
+	t.Helper()
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range families {
+		if f.GetName() == name && len(f.GetMetric()) > 0 {
+			return f.GetMetric()[0].GetHistogram().GetSampleSum()
+		}
+	}
+	return -1
+}
+
 // counterValue reads one counter series (matched by any label value).
 func counterValue(t *testing.T, reg *prometheus.Registry, name, labelValue string) float64 {
 	t.Helper()

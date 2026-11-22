@@ -238,7 +238,8 @@ Backoff handles brief blips; the breaker handles outages. Together they keep a
 - **Prometheus** at `GET /metrics` on the API (`:8080`) and the worker admin port
   (`:8082`): `notifications_created_total`, `notifications_sent_total`,
   `notifications_failed_total{reason}`, `delivery_attempts_total{outcome}`,
-  `delivery_latency_seconds`, `end_to_end_latency_seconds`,
+  `delivery_latency_seconds`, `end_to_end_latency_seconds` (created → sent),
+  `due_to_sent_seconds` (from `scheduled_at` when later),
   `queue_depth{channel,priority,status}`, `circuit_breaker_state`, plus HTTP and
   Go runtime metrics.
 - **Summary for humans:** `GET /api/v1/metrics/summary?window=15m` returns queue
