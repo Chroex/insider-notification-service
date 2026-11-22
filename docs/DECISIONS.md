@@ -251,9 +251,15 @@ reports every problem in one log line rather than one per restart.
 ## ADR-008: Separate liveness and readiness probes
 
 **Decision.** `/health/live` returns 200 whenever the process can serve HTTP.
-`/health/ready` pings Postgres and Redis concurrently with a 2s timeout and
-returns 503 if any fails. The worker serves the same endpoints on an admin port
-(`:8082`).
+`/health/ready` pings the dependencies concurrently with a 2s timeout and
+returns 503 if a *required* one fails. The worker serves the same endpoints on
+an admin port (`:8082`) and requires Postgres and Redis (it cannot send
+without the rate limiter). The API requires Postgres only: Redis is optional
+for it, because accepting notifications works without Redis and only the
+live WebSocket stream stops, so Redis down answers 200 `degraded` and keeps
+the API in rotation. (Revised: the API used to require Redis too, which
+would have stopped intake during a Redis outage for no reason; found by the
+interviewer agent.)
 
 **Why.** If liveness checked the database, a Postgres outage would make the
 orchestrator restart every pod in a loop: restarts cannot fix the database and

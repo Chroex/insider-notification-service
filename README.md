@@ -259,7 +259,10 @@ Backoff handles brief blips; the breaker handles outages. Together they keep a
   in the response, written to every API and worker log line, stored on the
   notification, and sent to the provider.
 - **Health:** `/health/live` (process up, never checks dependencies) and
-  `/health/ready` (Postgres and Redis reachable) on both API and worker.
+  `/health/ready` on both API and worker. The worker needs Postgres and
+  Redis. The API needs Postgres only: with Redis down it answers 200
+  `degraded` (just the live WebSocket stream stops), so a Redis outage does
+  not stop it from accepting notifications.
 - **Tracing (OpenTelemetry → Jaeger):** one trace per request follows the
   notification across the asynchronous queue: API handler → Postgres
   statements → every worker delivery attempt (`deliver sms`, with retries) →

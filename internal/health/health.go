@@ -4,7 +4,9 @@
 //     checks dependencies: restarting a pod because Postgres is down would
 //     not fix Postgres and would only add churn.
 //   - Readiness (/health/ready) answers "can this instance do useful work?".
-//     It pings Postgres and Redis so a load balancer stops routing to it.
+//     It pings the instance's dependencies so a load balancer stops routing
+//     to it when a required one is down. An optional dependency that is
+//     down is reported ("degraded") but keeps the instance in rotation.
 package health
 
 import (
@@ -19,6 +21,9 @@ import (
 type Check struct {
 	Name string
 	Ping func(ctx context.Context) error
+	// Optional marks a dependency the instance can work without, with a
+	// feature missing: its failure makes readiness "degraded", not 503.
+	Optional bool
 }
 
 type response struct {
@@ -41,20 +46,23 @@ func Register(mux *http.ServeMux, timeout time.Duration, checks ...Check) {
 		ctx, cancel := context.WithTimeout(r.Context(), timeout)
 		defer cancel()
 
-		results, healthy := runChecks(ctx, checks)
-		if !healthy {
+		results, healthy, degraded := runChecks(ctx, checks)
+		switch {
+		case !healthy:
 			writeJSON(w, http.StatusServiceUnavailable, response{Status: "unavailable", Checks: results})
-			return
+		case degraded:
+			writeJSON(w, http.StatusOK, response{Status: "degraded", Checks: results})
+		default:
+			writeJSON(w, http.StatusOK, response{Status: "ok", Checks: results})
 		}
-		writeJSON(w, http.StatusOK, response{Status: "ok", Checks: results})
 	})
 }
 
 // runChecks probes all dependencies concurrently so readiness latency is
 // the slowest check, not the sum of all checks.
-func runChecks(ctx context.Context, checks []Check) (map[string]string, bool) {
-	results := make(map[string]string, len(checks))
-	healthy := true
+func runChecks(ctx context.Context, checks []Check) (results map[string]string, healthy, degraded bool) {
+	results = make(map[string]string, len(checks))
+	healthy = true
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	for _, c := range checks {
@@ -66,14 +74,18 @@ func runChecks(ctx context.Context, checks []Check) (map[string]string, bool) {
 			defer mu.Unlock()
 			if err != nil {
 				results[c.Name] = "error: " + err.Error()
-				healthy = false
+				if c.Optional {
+					degraded = true
+				} else {
+					healthy = false
+				}
 				return
 			}
 			results[c.Name] = "ok"
 		}()
 	}
 	wg.Wait()
-	return results, healthy
+	return results, healthy, degraded
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

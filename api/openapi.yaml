@@ -404,7 +404,11 @@ paths:
   /health/ready:
     get:
       tags: [health]
-      summary: Readiness (Postgres and Redis are reachable)
+      summary: Readiness (required dependencies are reachable)
+      description: |
+        The API requires Postgres; Redis is optional for it (only the live
+        WebSocket stream needs it), so Redis being down answers 200
+        `degraded` and keeps the API in rotation. The worker requires both.
       operationId: healthReady
       responses:
         '200':
@@ -412,13 +416,18 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Health' }
-              example: { status: ok, checks: { postgres: ok, redis: ok } }
+              examples:
+                ok:
+                  value: { status: ok, checks: { postgres: ok, redis: ok } }
+                degraded:
+                  summary: Optional dependency down, still serving
+                  value: { status: degraded, checks: { postgres: ok, redis: 'error: context deadline exceeded' } }
         '503':
-          description: A dependency is unreachable.
+          description: A required dependency is unreachable.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Health' }
-              example: { status: unavailable, checks: { postgres: ok, redis: 'error: context deadline exceeded' } }
+              example: { status: unavailable, checks: { postgres: 'error: context deadline exceeded', redis: ok } }
 
 components:
   parameters:
@@ -870,7 +879,7 @@ components:
       additionalProperties: false
       required: [status]
       properties:
-        status: { type: string, enum: [ok, unavailable] }
+        status: { type: string, enum: [ok, degraded, unavailable] }
         checks:
           type: object
           additionalProperties: { type: string }

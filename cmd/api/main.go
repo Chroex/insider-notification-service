@@ -79,7 +79,10 @@ func run() error {
 		Hub:                hub,
 		Checks: []health.Check{
 			{Name: "postgres", Ping: db.Ping},
-			{Name: "redis", Ping: func(ctx context.Context) error { return rdb.Ping(ctx).Err() }},
+			// Accepting notifications needs Postgres only; without Redis
+			// just the live WebSocket stream stops. So a Redis outage
+			// degrades the API but keeps it in rotation.
+			{Name: "redis", Optional: true, Ping: func(ctx context.Context) error { return rdb.Ping(ctx).Err() }},
 		},
 	})
 

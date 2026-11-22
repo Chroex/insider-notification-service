@@ -91,3 +91,19 @@ func TestReady_RespectsTimeout(t *testing.T) {
 		t.Errorf("status = %d, want 503", rec.Code)
 	}
 }
+
+// An optional dependency (Redis for the API: only the live status stream
+// needs it) is reported but does not take the instance out of rotation:
+// accepting notifications needs Postgres alone.
+func TestReady_OptionalDependencyDownIsDegradedNotUnavailable(t *testing.T) {
+	redis := failingCheck("redis")
+	redis.Optional = true
+	rec, body := serve(t, "/health/ready", okCheck("postgres"), redis)
+	if rec.Code != http.StatusOK || body.Status != "degraded" || body.Checks["redis"] != "error: connection refused" {
+		t.Errorf("ready = %d %+v, want 200 degraded with the redis error", rec.Code, body)
+	}
+	rec, _ = serve(t, "/health/ready", failingCheck("postgres"), redis)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("required dependency down = %d, want 503", rec.Code)
+	}
+}
