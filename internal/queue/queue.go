@@ -97,6 +97,23 @@ func (q *Queue) Claim(ctx context.Context, channel domain.Channel, limit int, le
 	return jobs, nil
 }
 
+// Renew confirms the caller still owns a claimed row (still 'processing'
+// under its attempt number) and extends the lease for the send. The worker
+// calls it right before contacting the provider: a worker that stalled past
+// its lease (GC pause, slow database) while the reaper re-queued the row
+// and another worker claimed it gets false, and must not send.
+func (q *Queue) Renew(ctx context.Context, id uuid.UUID, attempt int, lease time.Duration) (bool, error) {
+	tag, err := q.pool.Exec(ctx, `
+		UPDATE notifications
+		SET locked_until = now() + $3 * interval '1 millisecond'
+		WHERE id = $1 AND status = 'processing' AND attempts = $2`,
+		id, attempt, lease.Milliseconds())
+	if err != nil {
+		return false, fmt.Errorf("renew: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
 // Completion is the result of one attempt, ready to persist.
 type Completion struct {
 	ID        uuid.UUID

@@ -505,6 +505,13 @@ it.
   that stalls past its lease cannot overwrite the result of the worker that
   re-claimed the row; it gets `ErrLeaseLost`. Its attempt is still written to
   `delivery_attempts`, because the call really happened. (Tested.)
+- **Ownership is confirmed again right before the send.** A conditional UPDATE
+  (`Renew`: still `processing` under my attempt number) also extends the
+  lease. A worker that stalled past its lease (GC pause, slow database) while
+  the reaper re-queued the row and another worker claimed it gets zero rows
+  and does not call the provider; otherwise both would send. One extra
+  single-row write per message. (Found by comparing with the Codex
+  implementation; integration-tested with a queue that simulates the stall.)
 - **The lost call is in the history** (migration 000009). The reaper writes
   the crashed claim's attempt as `outcome = 'interrupted'`, started at the
   claim (the row's `updated_at`) with no duration, because it is unknown.

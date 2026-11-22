@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
@@ -22,6 +23,7 @@ import (
 // dispatch loop can be unit tested without Postgres).
 type Queue interface {
 	Claim(ctx context.Context, channel domain.Channel, limit int, lease time.Duration) ([]domain.Notification, error)
+	Renew(ctx context.Context, id uuid.UUID, attempt int, lease time.Duration) (bool, error)
 	Complete(ctx context.Context, c queue.Completion) error
 	Release(ctx context.Context, jobs []domain.Notification) (int64, error)
 	ReapExpired(ctx context.Context) (queue.ReapResult, error)
@@ -292,6 +294,9 @@ func (w *Worker) process(stopCtx, sendCtx context.Context, job domain.Notificati
 		w.release(log, job, "released job: circuit breaker open")
 		return
 	}
+	if !w.stillOwned(sendCtx, log, job) {
+		return
+	}
 
 	// One span per attempt, continuing the trace of the request that created
 	// the notification (traceparent stored on the row), so a single trace
@@ -416,6 +421,29 @@ func (w *Worker) release(log *slog.Logger, job domain.Notification, reason strin
 		return
 	}
 	log.Info(reason)
+}
+
+// stillOwned checks, right before the provider call, that the row is still
+// ours (processing under our attempt number) and renews the lease for the
+// send. A worker that stalled past its lease may find the row re-queued
+// and claimed by another worker; sending anyway would deliver twice.
+func (w *Worker) stillOwned(ctx context.Context, log *slog.Logger, job domain.Notification) bool {
+	ctx, cancel := context.WithTimeout(ctx, persistTimeout)
+	defer cancel()
+	owned, err := w.queue.Renew(ctx, job.ID, job.Attempts, w.cfg.LeaseDuration)
+	switch {
+	case err != nil:
+		// Ownership unknown: don't send. Hand the job back (attempt
+		// refunded); if that fails too, the lease expires and the reaper
+		// recovers it.
+		log.Error("could not confirm ownership before sending", "error", err)
+		w.release(log, job, "released job: ownership check failed")
+		return false
+	case !owned:
+		log.Warn("lease lost before sending; another worker owns the row")
+		return false
+	}
+	return true
 }
 
 // reaperLoop periodically re-queues rows whose lease expired.

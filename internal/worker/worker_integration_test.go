@@ -184,7 +184,12 @@ func startWorkerWithLimiter(t *testing.T, providerURL string, cfg worker.Config,
 
 func startWorkerHandle(t *testing.T, providerURL string, cfg worker.Config, limiter worker.RateLimiter) (*worker.Worker, func()) {
 	t.Helper()
-	w := worker.New(queue.New(db.Pool), provider.NewClient(providerURL, 2*time.Second), limiter, cfg,
+	return startWorkerOn(t, queue.New(db.Pool), providerURL, cfg, limiter)
+}
+
+func startWorkerOn(t *testing.T, q worker.Queue, providerURL string, cfg worker.Config, limiter worker.RateLimiter) (*worker.Worker, func()) {
+	t.Helper()
+	w := worker.New(q, provider.NewClient(providerURL, 2*time.Second), limiter, cfg,
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -448,6 +453,40 @@ func TestDelivery_TwoWorkersNeverSendTheSameNotificationTwice(t *testing.T) {
 }
 
 // --- graceful shutdown ---
+
+// stalledQueue simulates a worker that stalls right after claiming: by the
+// time it would send, its lease expired, the reaper re-queued the row and
+// another worker claimed it (attempts moved on, row still processing).
+type stalledQueue struct{ *queue.Queue }
+
+func (q stalledQueue) Claim(ctx context.Context, ch domain.Channel, limit int, lease time.Duration) ([]domain.Notification, error) {
+	jobs, err := q.Queue.Claim(ctx, ch, limit, lease)
+	for _, j := range jobs {
+		if _, err := db.Pool.Exec(ctx, `UPDATE notifications
+			SET attempts = attempts + 1, locked_until = now() + interval '1 minute' WHERE id = $1`, j.ID); err != nil {
+			return nil, err
+		}
+	}
+	return jobs, err
+}
+
+// Review finding (Codex comparison): a worker must confirm it still owns
+// the row right before calling the provider, or a stalled worker sends a
+// message another worker is already sending.
+func TestDelivery_StalledWorkerDoesNotSendAfterLosingTheRow(t *testing.T) {
+	db.Reset(t)
+	fp := newFakeProvider(t, always(http.StatusAccepted))
+	n := insertNotification(t, domain.ChannelSMS)
+	startWorkerOn(t, stalledQueue{queue.New(db.Pool)}, fp.URL, testConfig(), worker.Unlimited{})
+
+	time.Sleep(500 * time.Millisecond) // many poll intervals
+	if calls := fp.totalCalls(); calls != 0 {
+		t.Fatalf("provider called %d times by a worker that no longer owns the row", calls)
+	}
+	if got := get(t, n.ID); got.Status != domain.StatusProcessing || got.Attempts != 2 {
+		t.Errorf("row = %s attempts %d; the newer owner's claim must be untouched", got.Status, got.Attempts)
+	}
+}
 
 func TestShutdown_FinishesInFlightSend(t *testing.T) {
 	db.Reset(t)
