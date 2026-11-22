@@ -225,8 +225,12 @@ Backoff handles brief blips; the breaker handles outages. Together they keep a
   number of worker replicas. A send takes a slot right before its HTTP call
   and keeps it while the request is in flight and for one second after, so
   the provider never sees more than 100 requests in any second (the brief's
-  maximum), however the network delays them. Measured at a fake provider with
-  three replicas: busiest second exactly 100. The cost: throughput is about
+  maximum), however the network delays them. A request that gets no answer
+  keeps its slot for the full max send time. One case no client can control,
+  a provider that stalls and then drains its backlog at once, is bounded by
+  the circuit breaker, which stops sending after the first timeouts.
+  Measured at a fake provider with three replicas, and with a provider that
+  stalls for 3 s: busiest second exactly 100. The cost: throughput is about
   `100 / (1 + provider latency)`, e.g. ~95/s at 50ms. Waiting workers sleep,
   they don't spin. If Redis is down, sending pauses rather than running
   unthrottled

@@ -202,8 +202,8 @@ func (w *Worker) Run(ctx context.Context) {
 // provider call: the limiter's window must count sends, not claims. Taken
 // here, the time between claim and send (ownership check, a slow database)
 // varies, and the provider saw up to 160 sends in one second. A claimed row
-// may now wait for a permit, but at most WORKER_CONCURRENCY rows per channel
-// do, for about a second at the full rate, far inside their lease.
+// may now wait for a permit, at most half its lease (permitToSend); past
+// that it is handed back unsent and claimed again later.
 func (w *Worker) claimLoop(ctx, sendCtx context.Context, ch domain.Channel, inflight *sync.WaitGroup) {
 	log := w.log.With(observability.KeyChannel, ch)
 	slots := make(chan struct{}, w.cfg.Concurrency)

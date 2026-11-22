@@ -640,8 +640,10 @@ request is in flight and for one second after it returns**:
    entries whose score is one second old, and grant a slot only if fewer than
    100 remain. The new entry's score is `now + max send time` (provider
    timeout + 1s), so it counts for as long as the request may be in flight.
-2. As soon as the call returns (success or not), `done.lua` lowers the score
-   to the finish time (`ZADD XX LT`), so the slot frees one second later.
+2. As soon as the call returns with an answer (any status), `done.lua`
+   lowers the score to the finish time (`ZADD XX LT`), so the slot frees one
+   second later. Without an answer (timeout, connection error) the score
+   stays at grant + max send time.
 3. A full window returns a wait (capped at 100ms, since a send may finish
    early), so a waiting worker sleeps instead of polling Redis.
 4. A worker that dies mid-send never calls `done`; its entry still expires
