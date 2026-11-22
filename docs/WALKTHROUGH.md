@@ -129,6 +129,8 @@ and each fix has a test that failed first.
 | With a short cooldown, an old send's success closed the breaker before the probe answered | Debate with the Codex version | Results belong to the breaker period they started in (ADR-024) |
 | A worker stalled past its lease could still send a row another worker had claimed | Debate with the Codex version | Re-check ownership right before the send (ADR-018) |
 | End-to-end latency left out the scheduled wait, unlike the brief's definition | Debate with the Codex version | Created → sent, plus a separate due → sent metric (ADR-026) |
+| Any 2xx counted as `sent`, so a misconfigured URL answering 200 would lose messages silently | Re-reading the brief: its provider contract is 202 | Only 202 is success; another 2xx fails loudly without a retry (ADR-019) |
+| Strict priority let a flood of `high` starve `low` forever; the brief only asks for priority support | Re-reading the brief against our own assumptions | Sends are shared 70/20/10 while several priorities wait (ADR-022) |
 | "Flaky" link errors | Investigating test failures | The disk was full: an environment problem, not code |
 
 ## A five-minute demo
