@@ -62,7 +62,7 @@ make seed                        # send a demo batch: every channel and priority
 | Mock provider | http://localhost:8090/send                | Stand-in for webhook.site, with failure injection |
 | Jaeger        | http://localhost:16686                    | Distributed traces (service `api`, `worker`, `mockprovider`) |
 | Postgres      | `localhost:5432`                          | user / password / db: `notifications` |
-| Redis         | `localhost:6379`                          | Rate-limit buckets |
+| Redis         | `localhost:6379`                          | Rate-limit windows (one per channel), live status events |
 
 `docker compose up` starts postgres and redis, runs the `migrate` one-shot
 container, and starts `api`, `worker`, `mockprovider`, `swagger-ui` and
@@ -475,7 +475,9 @@ fake provider, so they are deterministic. They cover:
 - the same Idempotency-Key never creates a duplicate (including 20 concurrent requests)
 - high priority claimed and sent before older low priority, and a flood of
   high cannot starve low
-- the rate limiter caps two worker replicas near 100/s per channel
+- the rate limiter caps two worker replicas at 100/s per channel, and the
+  provider never sees more than 100 in any second (three replicas, a backlog,
+  a bursty trickle, a slow database)
 - two concurrent workers never send the same notification twice (300 notifications)
 - crash recovery (reaper), stale workers can't overwrite newer claims, graceful shutdown
 - `Retry-After` honoured; the circuit breaker opens, stops traffic, and recovers

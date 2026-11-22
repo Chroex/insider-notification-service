@@ -666,7 +666,7 @@ three replicas, backlog and bursty trickle; `..._SlowOwnershipCheck...`, a
 4 replicas over 2s with instant sends: 200 grants. Two workers against a fast
 fake provider: 200 sends in 2s.
 
-**Revised, twice.**
+**Earlier versions (this is the third design).**
 1. The first version was a token bucket (100/s, burst 10): any 1-second
    window could hold 109 grants (measured 110). Burst 1 wasted capacity
    (about 77/s).
