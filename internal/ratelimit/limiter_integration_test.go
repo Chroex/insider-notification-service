@@ -217,3 +217,65 @@ func TestAcquire_CapsCombinedThroughputAcrossReplicas(t *testing.T) {
 	}
 	t.Logf("granted %.0f tokens in %v (expected ~%.0f), %d acquire calls", got, window, want, redisCalls.Load())
 }
+
+// Found by the failure-hunter agent (round 2). acquire.lua set PEXPIRE from
+// the caller's own max send time, overwriting a longer TTL another replica
+// set. During a rolling change of
+// PROVIDER_TIMEOUT (replicas with different maxSend share one window), the
+// short-TTL replica's grant makes the key expire while a long send is still
+// in flight, deleting its slot.
+func TestTryAcquire_ShortMaxSendReplicaCannotExpireALongInFlightSlot(t *testing.T) {
+	prefix := "test-" + uuid.NewString() + ":"
+	limits := map[domain.Channel]ratelimit.Limit{domain.ChannelSMS: {PerSecond: 2}}
+	oldReplica := ratelimit.New(rdb.Client, limits, prefix).WithMaxSend(6 * time.Second) // PROVIDER_TIMEOUT=5s
+	newReplica := ratelimit.New(rdb.Client, limits, prefix).WithMaxSend(2 * time.Second) // PROVIDER_TIMEOUT=1s
+	ctx := context.Background()
+
+	slow, _, err := oldReplica.TryAcquire(ctx, domain.ChannelSMS) // a 5s send, still in flight
+	if err != nil || slow == nil {
+		t.Fatal("first grant", err)
+	}
+	fast, _, _ := newReplica.TryAcquire(ctx, domain.ChannelSMS)
+	if fast == nil {
+		t.Fatal("second grant")
+	}
+	fast()                              // finishes at once
+	time.Sleep(4200 * time.Millisecond) // < 5s: the slow send is still in flight
+	inFlight := 1
+	granted := 0
+	for range 5 {
+		if d, _, _ := newReplica.TryAcquire(ctx, domain.ChannelSMS); d != nil {
+			granted++
+		}
+	}
+	if inFlight+granted > 2 {
+		t.Errorf("limit 2, slow send in flight, yet %d more granted (%d concurrent)", granted, inFlight+granted)
+	}
+	slow()
+}
+
+// Written by the failure-hunter agent (round 2; held). a send that outlives max send time loses its slot (entry
+// expired); done must not resurrect or corrupt anything (ZADD XX LT).
+func TestDone_AfterTheEntryExpiredIsANoOp(t *testing.T) {
+	l, prefix := newLimiter(1)
+	l.WithMaxSend(100 * time.Millisecond)
+	ctx := context.Background()
+	late, _, _ := l.TryAcquire(ctx, domain.ChannelSMS)
+	if late == nil {
+		t.Fatal("grant")
+	}
+	time.Sleep(1200 * time.Millisecond)
+	next, _, _ := l.TryAcquire(ctx, domain.ChannelSMS) // expired entry dropped, new grant
+	if next == nil {
+		t.Fatal("expired slot not reclaimed")
+	}
+	late() // must not touch the new entry
+	key := prefix + "ratelimit:{sms}"
+	if n, _ := rdb.Client.ZCard(ctx, key).Result(); n != 1 {
+		t.Errorf("window holds %d entries, want 1", n)
+	}
+	if d, _, _ := l.TryAcquire(ctx, domain.ChannelSMS); d != nil {
+		t.Error("late done freed the new send's slot")
+	}
+	next()
+}

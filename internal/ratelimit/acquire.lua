@@ -35,12 +35,22 @@ local now = tonumber(t[1]) * 1000000 + tonumber(t[2]) -- microseconds
 
 redis.call('ZREMRANGEBYSCORE', key, '-inf', now - windowUs)
 
+-- Let the keys expire once every entry could have left the window, but
+-- never shorten a TTL: another replica (e.g. during a rolling change of
+-- PROVIDER_TIMEOUT) may hold a send with a longer max send time.
+local function extend(k, ttl)
+  local current = redis.call('PTTL', k) -- -1: no TTL yet, -2: no key
+  if current < ttl then
+    redis.call('PEXPIRE', k, ttl)
+  end
+end
+
 local ttl = math.ceil((maxSend + windowUs) / 1000) + 1000
 if redis.call('ZCARD', key) < limit then
   local member = redis.call('INCR', seqKey)
   redis.call('ZADD', key, now + maxSend, member)
-  redis.call('PEXPIRE', key, ttl)
-  redis.call('PEXPIRE', seqKey, ttl)
+  extend(key, ttl)
+  extend(seqKey, ttl)
   return {member, 0}
 end
 
