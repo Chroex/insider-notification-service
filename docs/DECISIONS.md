@@ -25,7 +25,7 @@ Entries are added as the system is built; later entries may refine earlier ones.
 | [ADR-018](#adr-018-leases-fencing-and-the-reaper-delivery-is-at-least-once) | Leases, fencing and the reaper: delivery is at-least-once |
 | [ADR-019](#adr-019-error-classification-and-attempt-accounting) | Error classification and attempt accounting |
 | [ADR-020](#adr-020-graceful-shutdown) | Graceful shutdown |
-| [ADR-021](#adr-021-distributed-rate-limiting-with-a-redis-token-bucket-lua) | Distributed rate limiting with a Redis token bucket (Lua) |
+| [ADR-021](#adr-021-distributed-rate-limiting-with-a-redis-sliding-window-lua) | Distributed rate limiting with a Redis sliding window (Lua) |
 | [ADR-022](#adr-022-priority-with-weighted-fair-sharing-so-low-is-never-starved) | Priority with weighted fair sharing, so low is never starved |
 | [ADR-023](#adr-023-exponential-backoff-with-full-jitter-honouring-retry-after) | Exponential backoff with full jitter, honouring Retry-After |
 | [ADR-024](#adr-024-circuit-breaker-per-channel) | Circuit breaker per channel |
@@ -603,42 +603,49 @@ before exit.
 
 ---
 
-## ADR-021: Distributed rate limiting with a Redis token bucket (Lua)
+## ADR-021: Distributed rate limiting with a Redis sliding window (Lua)
 
-**Context.** Each channel's provider allows ~100 msg/s. The limit must hold
-across *all* worker replicas, not per process, and waiting workers must not
-spin.
+**Context.** The brief says "maximum 100 messages per second per channel".
+The limit must hold across *all* worker replicas, not per process, waiting
+workers must not spin, and the channel should still reach the full 100/s.
 
-**Decision.** One token bucket per channel in Redis (`ratelimit:<channel>`,
-a hash of `tokens` and `ts`), updated by a Lua script that Redis runs
-atomically:
-1. Read the bucket, refill `elapsed x rate` tokens (capped at `burst`).
-2. Grant `min(requested, floor(tokens))`. A **partial grant** lets a worker
-   with 10 free slots still send 3 if only 3 tokens exist.
-3. If nothing was granted, return `wait_ms` = time until the next whole
-   token. The caller sleeps exactly that long, so a waiting worker costs
-   one Redis call per token rather than a busy loop. (Tested: 20 concurrent
-   waiters made 230 calls for 210 tokens.)
-4. `PEXPIRE` the key once an idle bucket would be full anyway.
+**Decision.** One sliding window log per channel in Redis: a sorted set
+(`ratelimit:{<channel>}`) with one entry per grant, scored by grant time,
+updated by a Lua script that Redis runs atomically:
+1. Drop entries one second old or older.
+2. Grant `min(requested, 100 - entries)` and add one entry per grant. A
+   **partial grant** lets a worker with 10 free slots still send 3 if only 3
+   slots are free.
+3. If nothing was granted, return `wait_ms` = time until the oldest entry
+   leaves the window. The caller sleeps exactly that long, so a waiting
+   worker costs one Redis call per wake-up rather than a busy loop. (Tested:
+   20 concurrent waiters made 220 calls for 200 grants.)
+4. `PEXPIRE` the keys so a quiet channel leaves nothing behind.
 
-The script reads **Redis's clock** (`TIME`), not the caller's, so clock skew
-between worker hosts cannot inflate the rate.
+Every grant is checked against the second before it, so **no 1-second
+window can hold more than 100 grants**, wherever it starts. A slot frees
+exactly when its grant turns one second old, so a caller that comes back
+late loses nothing. The script reads **Redis's clock** (`TIME`), not the
+caller's, so clock skew between worker hosts cannot inflate the rate.
 
-**Where it sits in the worker.** Tokens are acquired *before* claiming rows,
-and the claim asks for at most as many rows as tokens granted. Unused tokens
-(fewer rows were due) are refunded. If tokens were taken *after* claiming, a
-claimed row would wait for a token while its lease ticks down, and a backlog
-would pile up as `processing` rows that are not actually being processed.
+**Where it sits in the worker.** Slots are acquired *before* claiming rows,
+and the claim asks for at most as many rows as slots granted. Unused slots
+(fewer rows were due) are refunded by removing the newest entries. If slots
+were taken *after* claiming, a claimed row would wait while its lease ticks
+down, and a backlog would pile up as `processing` rows that are not
+actually being processed.
 
-**Defaults.** 100 tokens/s per channel (`RATE_LIMIT_<CHANNEL>_PER_SECOND`),
-burst 10 (`RATE_LIMIT_BURST`). The burst is deliberately small. With
-burst = 100, a provider that counts fixed one-second windows could see up to
-~200 requests in one window right after an idle period and start returning
-429s. Burst 10 keeps any one-second window under ~110.
+**Defaults.** 100 per second per channel (`RATE_LIMIT_<CHANNEL>_PER_SECOND`).
 
-**Measured.** 4 limiter instances x 5 goroutines over 2s: exactly 210 grants
-(100/s x 2s + burst 10). 2 full worker replicas against 500 queued SMS: 209
-provider calls in 2s.
+**Measured.** 4 limiter instances x 5 goroutines over 2s: exactly 200 grants.
+2 worker replicas against 500 queued SMS: 200 provider calls in 2s.
+
+**Revised.** The first version was a token bucket (100/s, burst 10). Any
+1-second window could then hold burst + rate - 1 = 109 grants (measured:
+110), over the brief's maximum. Burst 1 fixes the window but wastes
+capacity: a bucket that holds one token loses refill whenever a waiter wakes
+a few milliseconds late, and measured throughput fell to about 77/s. The
+sliding window gives both: never over 100 in a second, and the full 100.
 
 **Failure mode: fail closed.** If Redis is unreachable, the channel pauses
 (logged, retried every poll interval) instead of sending unthrottled. Getting
@@ -646,20 +653,21 @@ throttled or banned by the provider is worse than a short pause, and the
 worker's `/health/ready` turns red so the outage is visible.
 
 **Alternatives.**
+- *Token bucket* (the first version): O(1) memory, but either exceeds 100 in
+  some second (burst > 1) or wastes capacity (burst 1), as above.
 - *Fixed window counter* (`INCR` + `EXPIRE`): simplest, but allows 2x the rate
   across a window boundary.
-- *Sliding log* (sorted set of timestamps): exact, but memory grows with the
-  rate.
 - *GCRA / `redis-cell`*: elegant, but needs a Redis module.
 - *Per-process limiter (`x/time/rate`)*: needs `rate / replicas` per process
   and breaks whenever replicas scale.
 
-Token bucket in Lua is exact enough, O(1) memory, and runs on plain Redis 7.
-
-**Trade-offs.** Each claim cycle costs 1-2 extra Redis round trips (acquire,
-maybe refund), negligible next to the provider call. An idle worker briefly
-holds tokens between acquire and refund; with burst 10 that can delay another
-replica by a few milliseconds.
+**Trade-offs.** Memory is one small set entry per send in the last second:
+at most 100 per channel. All 100 slots may be used at once after a quiet
+second; in practice the worker's free send slots spread them out. Each
+claim cycle costs 1-2 extra Redis round trips (acquire, maybe refund),
+negligible next to the provider call. The limit is checked when a slot is
+granted; the provider sees the send a few milliseconds later, so its own
+per-second count can drift by the jitter of those milliseconds.
 
 ---
 

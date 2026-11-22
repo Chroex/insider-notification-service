@@ -10,7 +10,7 @@ backoff, and stop calling a failing provider.
   written in one transaction, and reusable message templates.
 - **Asynchronous delivery:** `SELECT ... FOR UPDATE SKIP LOCKED` work queue
   with leases, crash recovery and graceful shutdown.
-- **Provider protection:** a Redis token bucket (100 msg/s per channel, shared
+- **Provider protection:** a Redis sliding window (at most 100 msg in any second per channel, shared
   across replicas) and a per-channel circuit breaker.
 - **Smart retries:** error classification, exponential backoff with full
   jitter, `Retry-After`, and a dead-letter set with manual redrive.
@@ -84,7 +84,7 @@ flowchart LR
         reaper[Lease reaper]
     end
     pg[(PostgreSQL<br/>notifications = queue<br/>batches · attempts)]
-    redis[(Redis<br/>token bucket per channel)]
+    redis[(Redis<br/>rate window per channel)]
     provider[[Provider<br/>webhook.site / mockprovider]]
     prom[(Prometheus)]
 
@@ -219,13 +219,14 @@ Backoff handles brief blips; the breaker handles outages. Together they keep a
 
 ## Rate limiting and priority
 
-- **Rate limit:** a token bucket per channel in Redis, updated by an atomic Lua
-  script using Redis's own clock, so the limit holds across any number of
-  worker replicas. Defaults: 100 msg/s per channel, burst 10. Workers take
-  tokens *before* claiming rows and sleep exactly until the next token is due
-  (no spinning). Measured: 100.0 sends/s per channel end to end. If Redis is
-  down, sending pauses rather than running unthrottled
-  ([ADR-021](docs/DECISIONS.md#adr-021-distributed-rate-limiting-with-a-redis-token-bucket-lua)).
+- **Rate limit:** a sliding window per channel in Redis, updated by an atomic
+  Lua script using Redis's own clock, so the limit holds across any number of
+  worker replicas. No 1-second window ever holds more than 100 sends per
+  channel (the brief's maximum), and the full 100/s is reached. Workers take
+  slots *before* claiming rows and sleep exactly until the oldest send leaves
+  the window (no spinning). Measured: 200 sends in 2 s with two workers. If
+  Redis is down, sending pauses rather than running unthrottled
+  ([ADR-021](docs/DECISIONS.md#adr-021-distributed-rate-limiting-with-a-redis-sliding-window-lua)).
 - **Priority:** weighted, so nothing starves. While several priorities are
   waiting, a channel's sends are shared 70/20/10 between `high`, `normal` and
   `low` (`PRIORITY_WEIGHTS`); a priority with nothing due gives its share to
@@ -423,7 +424,6 @@ problem listed in one error.
 | `RATE_LIMIT_SMS_PER_SECOND` | `100` | worker | SMS rate across all replicas |
 | `RATE_LIMIT_EMAIL_PER_SECOND` | `100` | worker | Email rate across all replicas |
 | `RATE_LIMIT_PUSH_PER_SECOND` | `100` | worker | Push rate across all replicas |
-| `RATE_LIMIT_BURST` | `10` | worker | Token bucket capacity |
 | `QUEUE_DEPTH_INTERVAL` | `15s` | worker | Refresh period of the `queue_depth` gauge |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset (compose: `http://jaeger:4318`) | all | Enables tracing (OTLP/HTTP); other standard `OTEL_*` variables apply |
 | `MOCK_ADDR` | `:8090` | mockprovider | Listen address |
@@ -525,7 +525,7 @@ internal/
   queue/          claim / complete / release / reap
   worker/         dispatcher, retry policy, backoff, circuit breaker
   provider/       provider HTTP client
-  ratelimit/      Redis token bucket (Lua scripts)
+  ratelimit/      Redis sliding-window rate limiter (Lua scripts)
   templating/     template compilation, variable discovery, rendering
   httpapi/        handlers, middleware, error mapping, CORS
   events/         status events published to Redis pub/sub

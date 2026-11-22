@@ -28,6 +28,9 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.LogLevel != slog.LevelInfo {
 		t.Errorf("LogLevel = %v, want info", cfg.LogLevel)
 	}
+	if cfg.RateLimit.PerSecond["sms"] != 100 {
+		t.Errorf("sms rate limit = %d, want 100", cfg.RateLimit.PerSecond["sms"])
+	}
 	if cfg.Worker.PriorityWeights != [3]int{70, 20, 10} {
 		t.Errorf("PriorityWeights = %v, want [70 20 10]", cfg.Worker.PriorityWeights)
 	}
@@ -101,11 +104,11 @@ func TestLoad_WorkerInvariants(t *testing.T) {
 }
 
 func TestLoad_RateLimit(t *testing.T) {
-	cfg, err := Load(lookupFrom(map[string]string{"RATE_LIMIT_SMS_PER_SECOND": "25.5"}))
+	cfg, err := Load(lookupFrom(map[string]string{"RATE_LIMIT_SMS_PER_SECOND": "25"}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.RateLimit.PerSecond["sms"] != 25.5 || cfg.RateLimit.PerSecond["email"] != 100 || cfg.RateLimit.Burst != 10 {
+	if cfg.RateLimit.PerSecond["sms"] != 25 || cfg.RateLimit.PerSecond["email"] != 100 {
 		t.Errorf("rate limit = %+v", cfg.RateLimit)
 	}
 	if _, err := Load(lookupFrom(map[string]string{"RATE_LIMIT_PUSH_PER_SECOND": "0"})); err == nil ||

@@ -86,11 +86,13 @@ hash tells a retry (200, same id) from a reused key (409). A replay is answered
 before validation, so a retried scheduled request still succeeds after its
 time has passed. `ON CONFLICT` settles races; 20 parallel requests make one row.
 
-**4. Rate limiting happens before claiming** (ADR-021). Tokens come from one
-Redis bucket per channel shared by every worker replica (100/s, burst 10).
-The worker takes tokens *first* and claims only as many rows as it got, so a
-throttled worker never holds rows it cannot send, and unused tokens are
-refunded. If Redis is down the channel pauses (fails closed) rather than risk
+**4. Rate limiting happens before claiming** (ADR-021). Redis keeps, per
+channel, the time of every send in the last second, shared by every worker
+replica. A send is allowed only while fewer than 100 happened in the last
+second, so no second ever has more than 100, and a slot frees the moment
+its send turns one second old, so the full rate is used. The worker takes
+slots *first* and claims only as many rows as it got, so a throttled worker
+never holds rows it cannot send, and unused slots are refunded. If Redis is down the channel pauses (fails closed) rather than risk
 the provider banning us.
 
 **5. Retries are deliberate** (ADR-019, ADR-023, ADR-024). Retry only what can
@@ -131,6 +133,7 @@ and each fix has a test that failed first.
 | End-to-end latency left out the scheduled wait, unlike the brief's definition | Debate with the Codex version | Created → sent, plus a separate due → sent metric (ADR-026) |
 | Any 2xx counted as `sent`, so a misconfigured URL answering 200 would lose messages silently | Re-reading the brief: its provider contract is 202 | Only 202 is success; another 2xx fails loudly without a retry (ADR-019) |
 | Strict priority let a flood of `high` starve `low` forever; the brief only asks for priority support | Re-reading the brief against our own assumptions | Sends are shared 70/20/10 while several priorities wait (ADR-022) |
+| A token bucket with burst 10 let one second carry 110 sends; burst 1 fixed that but dropped throughput to ~77/s | A test that counts the busiest 1-second window | Sliding window in Redis: never over 100 per second, full 100/s (ADR-021) |
 | "Flaky" link errors | Investigating test failures | The disk was full: an environment problem, not code |
 
 ## A five-minute demo

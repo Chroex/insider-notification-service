@@ -33,52 +33,82 @@ func TestMain(m *testing.M) {
 }
 
 // newLimiter returns a limiter with its own key namespace so tests never
-// share buckets.
-func newLimiter(perSecond float64, burst int) (*ratelimit.Limiter, string) {
+// share windows.
+func newLimiter(perSecond int) (*ratelimit.Limiter, string) {
 	prefix := "test-" + uuid.NewString() + ":"
 	limits := map[domain.Channel]ratelimit.Limit{
-		domain.ChannelSMS:   {PerSecond: perSecond, Burst: burst},
-		domain.ChannelEmail: {PerSecond: perSecond, Burst: burst},
+		domain.ChannelSMS:   {PerSecond: perSecond},
+		domain.ChannelEmail: {PerSecond: perSecond},
 	}
 	return ratelimit.New(rdb.Client, limits, prefix), prefix
 }
 
-func TestTryAcquire_BurstThenWait(t *testing.T) {
-	l, _ := newLimiter(10, 5) // 10/s -> one token every 100ms
+func TestTryAcquire_GrantsUpToTheLimitThenWaits(t *testing.T) {
+	l, _ := newLimiter(5)
 	ctx := context.Background()
 
 	granted, _, err := l.TryAcquire(ctx, domain.ChannelSMS, 3)
 	if err != nil || granted != 3 {
-		t.Fatalf("first acquire = %d, %v; want 3 from a full bucket", granted, err)
+		t.Fatalf("first acquire = %d, %v; want 3", granted, err)
 	}
-	// Only 2 left: a request for 5 is partially granted.
+	// Only 2 left in this second: a request for 5 is partially granted.
 	if granted, _, _ := l.TryAcquire(ctx, domain.ChannelSMS, 5); granted != 2 {
 		t.Errorf("partial acquire = %d, want 2", granted)
 	}
-	// Empty: nothing granted, and the wait says when the next token exists.
+	// Full: nothing granted, and the wait says when the oldest grant leaves
+	// the 1-second window.
 	granted, wait, _ := l.TryAcquire(ctx, domain.ChannelSMS, 1)
-	if granted != 0 || wait <= 0 || wait > 100*time.Millisecond {
-		t.Errorf("empty bucket = granted %d wait %v; want 0 and (0, 100ms]", granted, wait)
+	if granted != 0 || wait <= 0 || wait > time.Second {
+		t.Errorf("full window = granted %d wait %v; want 0 and (0, 1s]", granted, wait)
 	}
 }
 
-func TestTryAcquire_RefillsOverTime(t *testing.T) {
-	l, _ := newLimiter(20, 2) // a token every 50ms
+// The brief: "maximum 100 messages per second per channel". All 100 may go
+// at once, but the 101st waits until the first is a full second old, so no
+// 1-second window ever holds more than 100. Checked against the limiter
+// itself, so network jitter cannot blur the boundary.
+func TestTryAcquire_NeverMoreThanTheLimitInOneSecond(t *testing.T) {
+	l, _ := newLimiter(100)
+	ctx := context.Background()
+
+	if g, _, _ := l.TryAcquire(ctx, domain.ChannelSMS, 150); g != 100 {
+		t.Fatalf("first acquire granted %d, want the full 100", g)
+	}
+	g, wait, _ := l.TryAcquire(ctx, domain.ChannelSMS, 1)
+	if g != 0 || wait < 900*time.Millisecond || wait > time.Second {
+		t.Fatalf("101st = granted %d wait %v; want 0 and a wait of almost 1s", g, wait)
+	}
+	time.Sleep(wait - 100*time.Millisecond)
+	if g, _, _ := l.TryAcquire(ctx, domain.ChannelSMS, 1); g != 0 {
+		t.Errorf("granted %d before the first grants were a second old", g)
+	}
+	time.Sleep(150 * time.Millisecond)
+	if g, _, _ := l.TryAcquire(ctx, domain.ChannelSMS, 150); g != 100 {
+		t.Errorf("after the window slid, granted %d, want 100 again", g)
+	}
+}
+
+// Unlike a token bucket, unused capacity is never lost: whatever left the
+// window can be used, however late the caller comes back.
+func TestTryAcquire_SlotsFreeUpAsTheWindowSlides(t *testing.T) {
+	l, _ := newLimiter(2)
 	ctx := context.Background()
 	if g, _, _ := l.TryAcquire(ctx, domain.ChannelSMS, 2); g != 2 {
-		t.Fatalf("drain = %d", g)
+		t.Fatalf("fill = %d", g)
 	}
-	time.Sleep(120 * time.Millisecond) // ~2.4 tokens, capped at burst 2
+	time.Sleep(1050 * time.Millisecond)
 	if g, _, _ := l.TryAcquire(ctx, domain.ChannelSMS, 5); g != 2 {
-		t.Errorf("after refill granted %d, want 2 (capped at burst)", g)
+		t.Errorf("after the window slid granted %d, want 2", g)
 	}
 }
 
-func TestRefund_ReturnsTokensUpToBurst(t *testing.T) {
-	l, _ := newLimiter(1, 5)
+// A refund frees slots for sends that never happened, never more than the
+// limit.
+func TestRefund_FreesUnusedSlots(t *testing.T) {
+	l, _ := newLimiter(5)
 	ctx := context.Background()
 	if g, _, _ := l.TryAcquire(ctx, domain.ChannelSMS, 5); g != 5 {
-		t.Fatalf("drain = %d", g)
+		t.Fatalf("fill = %d", g)
 	}
 	if err := l.Refund(ctx, domain.ChannelSMS, 3); err != nil {
 		t.Fatal(err)
@@ -90,12 +120,12 @@ func TestRefund_ReturnsTokensUpToBurst(t *testing.T) {
 		t.Fatal(err)
 	}
 	if g, _, _ := l.TryAcquire(ctx, domain.ChannelSMS, 100); g != 5 {
-		t.Errorf("refund above burst granted %d, want 5 (capped)", g)
+		t.Errorf("refund above the limit granted %d, want 5 (capped)", g)
 	}
 }
 
 func TestChannelsHaveIndependentBuckets(t *testing.T) {
-	l, _ := newLimiter(1, 2)
+	l, _ := newLimiter(2)
 	ctx := context.Background()
 	if g, _, _ := l.TryAcquire(ctx, domain.ChannelSMS, 2); g != 2 {
 		t.Fatalf("sms drain = %d", g)
@@ -106,14 +136,14 @@ func TestChannelsHaveIndependentBuckets(t *testing.T) {
 }
 
 func TestUnknownChannelIsAnError(t *testing.T) {
-	l, _ := newLimiter(1, 1)
+	l, _ := newLimiter(1)
 	if _, _, err := l.TryAcquire(context.Background(), domain.ChannelPush, 1); err == nil {
 		t.Error("expected an error for a channel without a configured limit")
 	}
 }
 
 func TestAcquire_RespectsContextWhileWaiting(t *testing.T) {
-	l, _ := newLimiter(0.5, 1) // next token in 2s
+	l, _ := newLimiter(1) // the next slot frees in 1s
 	ctx := context.Background()
 	if _, err := l.Acquire(ctx, domain.ChannelSMS, 1); err != nil {
 		t.Fatal(err)
@@ -130,17 +160,17 @@ func TestAcquire_RespectsContextWhileWaiting(t *testing.T) {
 }
 
 // Several limiter instances model several worker replicas: they share one
-// bucket, so their combined throughput is capped, not each one separately.
-// Over a window W the expected total is burst + rate*W.
+// window, so their combined throughput is capped, not each one separately.
+// Over 2 seconds that is at most 2 x 100, and nothing is wasted: the full
+// 200 are used.
 func TestAcquire_CapsCombinedThroughputAcrossReplicas(t *testing.T) {
 	const (
-		rate    = 100.0
-		burst   = 10
+		rate    = 100
 		window  = 2 * time.Second
 		clients = 4 // independent Limiter instances = replicas
 	)
-	_, prefix := newLimiter(rate, burst)
-	limits := map[domain.Channel]ratelimit.Limit{domain.ChannelSMS: {PerSecond: rate, Burst: burst}}
+	_, prefix := newLimiter(rate)
+	limits := map[domain.Channel]ratelimit.Limit{domain.ChannelSMS: {PerSecond: rate}}
 
 	ctx, cancel := context.WithTimeout(context.Background(), window)
 	defer cancel()
@@ -165,10 +195,12 @@ func TestAcquire_CapsCombinedThroughputAcrossReplicas(t *testing.T) {
 	}
 	wg.Wait()
 
-	want := float64(burst) + rate*window.Seconds() // 210
+	want := float64(rate) * window.Seconds() // 200
 	got := float64(total.Load())
-	if got < want*0.9 || got > want*1.05 {
-		t.Errorf("combined grants over %v = %.0f, want ~%.0f (rate %v/s + burst %d)", window, got, want, rate, burst)
+	// A call already inside Redis when the deadline passes can still be
+	// granted, hence the small allowance above 200.
+	if got < want*0.95 || got > want+5 {
+		t.Errorf("combined grants over %v = %.0f, want ~%.0f (%d/s)", window, got, want, rate)
 	}
 	// No busy spinning: waiters sleep until the next token, so Redis calls
 	// stay within a small multiple of the tokens granted.

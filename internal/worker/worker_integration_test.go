@@ -727,8 +727,8 @@ func TestQueue_ClaimIsPerChannel(t *testing.T) {
 
 // --- rate limiting ---
 
-// Two worker replicas share one Redis bucket, so together they must stay
-// near rate*window + burst, not 2x that.
+// Two worker replicas share one Redis window, so together they send at most
+// 100 per second, not 2x that, and still reach that full rate.
 func TestRateLimit_CapsChannelThroughputAcrossWorkers(t *testing.T) {
 	db.Reset(t)
 	fp := newFakeProvider(t, always(http.StatusAccepted))
@@ -736,10 +736,10 @@ func TestRateLimit_CapsChannelThroughputAcrossWorkers(t *testing.T) {
 		insertNotification(t, domain.ChannelSMS)
 	}
 
-	const rate, burst = 100.0, 10
+	const rate = 100
 	limits := map[domain.Channel]ratelimit.Limit{}
 	for _, ch := range domain.Channels {
-		limits[ch] = ratelimit.Limit{PerSecond: rate, Burst: burst}
+		limits[ch] = ratelimit.Limit{PerSecond: rate}
 	}
 	prefix := "test-" + uuid.NewString() + ":"
 	cfg := testConfig()
@@ -752,9 +752,11 @@ func TestRateLimit_CapsChannelThroughputAcrossWorkers(t *testing.T) {
 	stopA()
 	stopB()
 
-	want := float64(burst) + rate*window.Seconds() // ~210
+	want := float64(rate) * window.Seconds() // 200
 	got := float64(fp.totalCalls())
-	if got < want*0.8 || got > want*1.15 {
+	// At most 100 in any second (a send already granted at the deadline
+	// may still land), and close to that: no capacity wasted.
+	if got < want*0.9 || got > want+10 {
 		t.Errorf("provider received %.0f sms in %v with 2 workers, want ~%.0f", got, window, want)
 	}
 	t.Logf("2 workers sent %.0f sms in %v (cap ~%.0f)", got, window, want)

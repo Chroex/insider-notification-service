@@ -83,7 +83,7 @@ func run() error {
 
 	limits := make(map[domain.Channel]ratelimit.Limit, len(domain.Channels))
 	for _, ch := range domain.Channels {
-		limits[ch] = ratelimit.Limit{PerSecond: cfg.RateLimit.PerSecond[string(ch)], Burst: cfg.RateLimit.Burst}
+		limits[ch] = ratelimit.Limit{PerSecond: cfg.RateLimit.PerSecond[string(ch)]}
 	}
 
 	engine := worker.New(

@@ -35,7 +35,7 @@ type Sender interface {
 }
 
 // RateLimiter hands out per-channel send permits; implemented by
-// ratelimit.Limiter (Redis token bucket shared by all replicas).
+// ratelimit.Limiter (Redis sliding window shared by all replicas).
 type RateLimiter interface {
 	// Acquire blocks until it can grant between 1 and n permits.
 	Acquire(ctx context.Context, ch domain.Channel, n int) (int, error)
@@ -411,7 +411,7 @@ func (w *Worker) observeDecision(job domain.Notification, d Decision) {
 }
 
 // refund returns unused tokens. Failure only costs a little throughput (the
-// tokens refill anyway), so it is logged, not retried.
+// slots free up within a second anyway), so it is logged, not retried.
 func (w *Worker) refund(log *slog.Logger, ch domain.Channel, n int) {
 	if n <= 0 {
 		return

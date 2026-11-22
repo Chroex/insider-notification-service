@@ -1,8 +1,10 @@
-// Package ratelimit is a distributed per-channel token bucket in Redis.
+// Package ratelimit is a distributed per-channel rate limiter in Redis: a
+// sliding window log that allows at most PerSecond sends in any 1-second
+// window.
 //
-// The bucket state lives in Redis and is updated by a Lua script, which
-// Redis executes atomically. That makes the limit global: running 1 or 10
-// worker replicas, the provider still sees at most ~rate msg/s per channel.
+// The window lives in Redis and is updated by a Lua script, which Redis
+// executes atomically. That makes the limit global: running 1 or 10 worker
+// replicas, the provider still sees at most PerSecond msg/s per channel.
 package ratelimit
 
 import (
@@ -28,10 +30,9 @@ var (
 	refundScript  = redis.NewScript(refundSource)
 )
 
-// Limit is one channel's bucket configuration.
+// Limit is one channel's limit: sends allowed in any 1-second window.
 type Limit struct {
-	PerSecond float64
-	Burst     int
+	PerSecond int
 }
 
 // Limiter holds the Redis client and per-channel limits. Safe for
@@ -42,22 +43,21 @@ type Limiter struct {
 	keyPrefix string
 }
 
-// New returns a limiter. keyPrefix namespaces the bucket keys (tests use a
-// unique prefix so they don't share buckets).
+// New returns a limiter. keyPrefix namespaces the window keys (tests use a
+// unique prefix so they don't share windows).
 func New(rdb redis.Scripter, limits map[domain.Channel]Limit, keyPrefix string) *Limiter {
 	return &Limiter{rdb: rdb, limits: limits, keyPrefix: keyPrefix}
 }
 
-// TryAcquire makes one attempt to take up to n tokens. It returns how many
-// were granted (possibly fewer than n) and, when none were, how long until
-// the next token is available.
+// TryAcquire makes one attempt to take up to n send slots ("tokens"). It
+// returns how many were granted (possibly fewer than n) and, when none
+// were, how long until the oldest grant leaves the window.
 func (l *Limiter) TryAcquire(ctx context.Context, ch domain.Channel, n int) (int, time.Duration, error) {
 	limit, err := l.limit(ch)
 	if err != nil {
 		return 0, 0, err
 	}
-	res, err := acquireScript.Run(ctx, l.rdb, []string{l.key(ch)},
-		limit.PerSecond, limit.Burst, n).Int64Slice()
+	res, err := acquireScript.Run(ctx, l.rdb, l.keys(ch), limit.PerSecond, n).Int64Slice()
 	if err != nil {
 		return 0, 0, fmt.Errorf("rate limit acquire (%s): %w", ch, err)
 	}
@@ -67,10 +67,10 @@ func (l *Limiter) TryAcquire(ctx context.Context, ch domain.Channel, n int) (int
 	return int(res[0]), time.Duration(res[1]) * time.Millisecond, nil
 }
 
-// Acquire blocks until at least one token is granted (returning up to n) or
-// ctx is done. When the bucket is empty it sleeps exactly until the next
-// token is due, so a waiting worker costs one Redis call per token, not a
-// busy loop.
+// Acquire blocks until at least one slot is granted (returning up to n) or
+// ctx is done. When the window is full it sleeps exactly until the oldest
+// grant expires, so a waiting worker costs one Redis call per wake-up, not
+// a busy loop.
 func (l *Limiter) Acquire(ctx context.Context, ch domain.Channel, n int) (int, error) {
 	for {
 		granted, wait, err := l.TryAcquire(ctx, ch, n)
@@ -90,16 +90,15 @@ func (l *Limiter) Acquire(ctx context.Context, ch domain.Channel, n int) (int, e
 	}
 }
 
-// Refund returns n unused tokens to the bucket.
+// Refund gives back n slots that were granted but not used.
 func (l *Limiter) Refund(ctx context.Context, ch domain.Channel, n int) error {
 	if n <= 0 {
 		return nil
 	}
-	limit, err := l.limit(ch)
-	if err != nil {
+	if _, err := l.limit(ch); err != nil {
 		return err
 	}
-	if err := refundScript.Run(ctx, l.rdb, []string{l.key(ch)}, n, limit.Burst).Err(); err != nil {
+	if err := refundScript.Run(ctx, l.rdb, l.keys(ch)[:1], n).Err(); err != nil {
 		return fmt.Errorf("rate limit refund (%s): %w", ch, err)
 	}
 	return nil
@@ -113,6 +112,9 @@ func (l *Limiter) limit(ch domain.Channel) (Limit, error) {
 	return limit, nil
 }
 
-func (l *Limiter) key(ch domain.Channel) string {
-	return l.keyPrefix + "ratelimit:" + string(ch)
+// keys returns the window key and its sequence key. The {braces} hash tag
+// keeps both in one Redis Cluster slot, as a multi-key script requires.
+func (l *Limiter) keys(ch domain.Channel) []string {
+	base := l.keyPrefix + "ratelimit:{" + string(ch) + "}"
+	return []string{base, base + ":seq"}
 }
