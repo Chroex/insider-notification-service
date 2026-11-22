@@ -25,7 +25,7 @@ Entries are added as the system is built; later entries may refine earlier ones.
 | [ADR-018](#adr-018-leases-fencing-and-the-reaper-delivery-is-at-least-once) | Leases, fencing and the reaper: delivery is at-least-once |
 | [ADR-019](#adr-019-error-classification-and-attempt-accounting) | Error classification and attempt accounting |
 | [ADR-020](#adr-020-graceful-shutdown) | Graceful shutdown |
-| [ADR-021](#adr-021-distributed-rate-limiting-with-a-redis-sliding-window-lua) | Distributed rate limiting with a Redis sliding window (Lua) |
+| [ADR-021](#adr-021-distributed-rate-limiting-with-a-redis-sliding-window-of-sends-lua) | Distributed rate limiting with a Redis sliding window of sends (Lua) |
 | [ADR-022](#adr-022-priority-with-weighted-fair-sharing-so-low-is-never-starved) | Priority with weighted fair sharing, so low is never starved |
 | [ADR-023](#adr-023-exponential-backoff-with-full-jitter-honouring-retry-after) | Exponential backoff with full jitter, honouring Retry-After |
 | [ADR-024](#adr-024-circuit-breaker-per-channel) | Circuit breaker per channel |
@@ -453,19 +453,26 @@ the provider; claiming we cancelled it would be a lie.
 grabs up to `CLAIM_BATCH_SIZE` free slots, and claims exactly that many rows:
 
 ```sql
-WITH due AS (
-  SELECT id FROM notifications
-  WHERE status IN ('scheduled','pending','retrying') AND channel = $1
-    AND next_attempt_at <= now()
-  ORDER BY priority_rank, next_attempt_at
-  LIMIT $2
-  FOR UPDATE SKIP LOCKED)
+WITH high   AS (SELECT id FROM notifications WHERE <due> AND priority_rank = 0
+                ORDER BY next_attempt_at LIMIT $high FOR UPDATE SKIP LOCKED),
+     normal AS (... priority_rank = 1 ... LIMIT $normal ...),
+     low    AS (... priority_rank = 2 ... LIMIT $low ...),
+     picked AS (SELECT id FROM high UNION ALL SELECT id FROM normal UNION ALL SELECT id FROM low),
+     fill   AS (SELECT id FROM notifications WHERE <due> AND id NOT IN (SELECT id FROM picked)
+                ORDER BY priority_rank, next_attempt_at
+                LIMIT $total - (SELECT count(*) FROM picked) FOR UPDATE SKIP LOCKED)
 UPDATE notifications n
 SET status = 'processing', attempts = n.attempts + 1,
     locked_until = now() + <lease>
-FROM due WHERE n.id = due.id
+WHERE n.id IN (SELECT id FROM picked UNION ALL SELECT id FROM fill)
 RETURNING ...
+-- <due>: status IN ('scheduled','pending','retrying') AND channel = $1
+--        AND next_attempt_at <= now() AND attempts < max_attempts
 ```
+
+The per-priority limits come from the fair-share planner (ADR-022); with
+`PRIORITY_WEIGHTS=100,0,0` only `fill` takes rows and the claim is the
+plain strict-priority `ORDER BY priority_rank, next_attempt_at`.
 
 Each claimed row gets its own goroutine; the slot is freed when the send is
 recorded. An empty claim sleeps `POLL_INTERVAL` (500ms) before trying again.
@@ -478,7 +485,10 @@ recorded. An empty claim sleeps `POLL_INTERVAL` (500ms) before trying again.
   without waiting on each other. Tested: two workers, 300 notifications, each
   delivered exactly once.
 - **Claiming only as many rows as there are free slots** means a claimed row
-  never sits waiting for a slot while its lease ticks down.
+  never sits waiting for a send slot while its lease ticks down. It may wait
+  for a rate-limit permit (ADR-021), but at most `WORKER_CONCURRENCY` rows
+  per channel do, for about a second at the full rate, far inside the
+  30-second lease.
 - **Per-channel loops** isolate channels: a slow SMS provider cannot starve
   email sends.
 
@@ -603,71 +613,84 @@ before exit.
 
 ---
 
-## ADR-021: Distributed rate limiting with a Redis sliding window (Lua)
+## ADR-021: Distributed rate limiting with a Redis sliding window of sends (Lua)
 
 **Context.** The brief says "maximum 100 messages per second per channel".
-The limit must hold across *all* worker replicas, not per process, waiting
-workers must not spin, and the channel should still reach the full 100/s.
+The limit must hold across *all* worker replicas, not per process, it must
+hold *as the provider sees it* (the provider counts requests when they
+arrive, which we cannot observe), and waiting workers must not spin.
 
-**Decision.** One sliding window log per channel in Redis: a sorted set
-(`ratelimit:{<channel>}`) with one entry per grant, scored by grant time,
-updated by a Lua script that Redis runs atomically:
-1. Drop entries one second old or older.
-2. Grant `min(requested, 100 - entries)` and add one entry per grant. A
-   **partial grant** lets a worker with 10 free slots still send 3 if only 3
-   slots are free.
-3. If nothing was granted, return `wait_ms` = time until the oldest entry
-   leaves the window. The caller sleeps exactly that long, so a waiting
-   worker costs one Redis call per wake-up rather than a busy loop. (Tested:
-   20 concurrent waiters made 220 calls for 200 grants.)
-4. `PEXPIRE` the keys so a quiet channel leaves nothing behind.
+**Decision.** One sorted set per channel in Redis (`ratelimit:{<channel>}`),
+one entry per send that still counts. A send's entry counts **while the
+request is in flight and for one second after it returns**:
+1. Right before each provider call, the worker runs `acquire.lua`: drop
+   entries whose score is one second old, and grant a slot only if fewer than
+   100 remain. The new entry's score is `now + max send time` (provider
+   timeout + 1s), so it counts for as long as the request may be in flight.
+2. As soon as the call returns (success or not), `done.lua` lowers the score
+   to the finish time (`ZADD XX LT`), so the slot frees one second later.
+3. A full window returns a wait (capped at 100ms, since a send may finish
+   early), so a waiting worker sleeps instead of polling Redis.
+4. A worker that dies mid-send never calls `done`; its entry still expires
+   one second after the max send time.
 
-Every grant is checked against the second before it, so **no 1-second
-window can hold more than 100 grants**, wherever it starts. A slot frees
-exactly when its grant turns one second old, so a caller that comes back
-late loses nothing. The script reads **Redis's clock** (`TIME`), not the
-caller's, so clock skew between worker hosts cannot inflate the rate.
+**Why this holds at the provider.** The provider receives each request at
+some moment between our start and its answer. Take any 1-second window of
+arrivals and the request in it whose slot was granted last. Every other
+request in the window either was still in flight at that grant or had
+finished less than a second before it (it arrived inside the window, which
+started less than a second before that grant), so it still held its slot:
+there were at most 99 of them. So the provider never sees more than 100 in
+any second, whatever the network delays. The script reads **Redis's clock**
+(`TIME`), so clock skew between worker hosts cannot inflate the rate.
 
-**Where it sits in the worker.** Slots are acquired *before* claiming rows,
-and the claim asks for at most as many rows as slots granted. Unused slots
-(fewer rows were due) are refunded by removing the newest entries. If slots
-were taken *after* claiming, a claimed row would wait while its lease ticks
-down, and a backlog would pile up as `processing` rows that are not
-actually being processed.
+**Where it sits in the worker.** The claim is sized by free send slots
+(ADR-017); the permit is taken in `process`, after the ownership check and
+immediately before the HTTP call, and released when the call returns.
+Every permit is used, so nothing is ever refunded.
 
 **Defaults.** 100 per second per channel (`RATE_LIMIT_<CHANNEL>_PER_SECOND`).
 
-**Measured.** 4 limiter instances x 5 goroutines over 2s: exactly 200 grants.
-2 worker replicas against 500 queued SMS: 200 provider calls in 2s.
+**Measured.** At the provider (`TestRateLimit_ProviderNeverSeesMoreThan100PerSecond`,
+three replicas, backlog and bursty trickle; `..._SlowOwnershipCheck...`, a
+400ms database hiccup): busiest 1-second window exactly 100. Limiter alone,
+4 replicas over 2s with instant sends: 200 grants. Two workers against a fast
+fake provider: 200 sends in 2s.
 
-**Revised.** The first version was a token bucket (100/s, burst 10). Any
-1-second window could then hold burst + rate - 1 = 109 grants (measured:
-110), over the brief's maximum. Burst 1 fixes the window but wastes
-capacity: a bucket that holds one token loses refill whenever a waiter wakes
-a few milliseconds late, and measured throughput fell to about 77/s. The
-sliding window gives both: never over 100 in a second, and the full 100.
+**Revised, twice.**
+1. The first version was a token bucket (100/s, burst 10): any 1-second
+   window could hold 109 grants (measured 110). Burst 1 wasted capacity
+   (about 77/s).
+2. The second was a sliding window of *grants*, taken before the claim and
+   refunded with `ZPOPMAX`. The failure-hunter agent broke it twice: a refund
+   removed another replica's entries (103 in a second), and because the time
+   between grant and send varied (claim, ownership check, a cold
+   connection), the provider saw up to 160 sends in one second (200 with a
+   slow database).
 
-**Failure mode: fail closed.** If Redis is unreachable, the channel pauses
-(logged, retried every poll interval) instead of sending unthrottled. Getting
-throttled or banned by the provider is worse than a short pause, and the
-worker's `/health/ready` turns red so the outage is visible.
+**Failure mode: fail closed.** If Redis is unreachable, the job is handed
+back unsent after a poll interval (the send slot stays busy meanwhile, so
+this does not become a claim-release loop). Getting throttled or banned by
+the provider is worse than a short pause, and the worker's `/health/ready`
+turns red so the outage is visible.
 
 **Alternatives.**
-- *Token bucket* (the first version): O(1) memory, but either exceeds 100 in
-  some second (burst > 1) or wastes capacity (burst 1), as above.
-- *Fixed window counter* (`INCR` + `EXPIRE`): simplest, but allows 2x the rate
-  across a window boundary.
+- *Token bucket*: O(1) memory, but either exceeds 100 in some second
+  (burst > 1) or wastes capacity (burst 1).
+- *Counting grants, not sends* (the second version): full 100/s, but only
+  "at most 100 grants per second"; the provider can see more.
+- *Fixed window counter* (`INCR` + `EXPIRE`): simplest, but allows 2x the
+  rate across a window boundary.
 - *GCRA / `redis-cell`*: elegant, but needs a Redis module.
 - *Per-process limiter (`x/time/rate`)*: needs `rate / replicas` per process
   and breaks whenever replicas scale.
 
-**Trade-offs.** Memory is one small set entry per send in the last second:
-at most 100 per channel. All 100 slots may be used at once after a quiet
-second; in practice the worker's free send slots spread them out. Each
-claim cycle costs 1-2 extra Redis round trips (acquire, maybe refund),
-negligible next to the provider call. The limit is checked when a slot is
-granted; the provider sees the send a few milliseconds later, so its own
-per-second count can drift by the jitter of those milliseconds.
+**Trade-offs.** Holding a slot for the request's duration plus one second
+caps throughput at about `100 / (1 + provider latency in seconds)`: about
+95/s at 50ms, 83/s at 200ms. The brief sets a maximum, so we stay under it
+rather than risk going over; with a fast provider the full 100/s is reached.
+Each send costs two Redis round trips (acquire, done), negligible next to
+the provider call. Memory is at most 100 small entries per channel.
 
 ---
 

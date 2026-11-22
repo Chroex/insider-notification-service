@@ -91,8 +91,8 @@ flowchart LR
     client -- "POST /api/v1/notifications" --> api
     api -- "INSERT (status = pending)" --> pg
     claim -- "SELECT … FOR UPDATE SKIP LOCKED" --> pg
-    claim -- "acquire tokens (Lua)" --> redis
     claim --> send
+    send -- "rate-limit slot (Lua)" --> redis
     send -- "POST {to, channel, content}<br/>X-Correlation-ID, X-Notification-ID" --> provider
     send -- "record attempt + status" --> pg
     reaper -- "re-queue expired leases" --> pg
@@ -106,11 +106,11 @@ Two binaries from one Go module, plus a mock:
   rows with status `pending`. That insert *is* the enqueue, so there is no
   dual write to a broker. It never calls the provider.
 - **`cmd/worker`** runs one claim loop per channel. Each iteration asks the
-  circuit breaker for permission, waits for free send slots, takes tokens from
-  the Redis rate limiter, then claims at most that many due rows (high priority
-  first) in one short statement that commits **before** any HTTP call. Each row
-  is sent in its own goroutine; the result and the attempt are written in one
-  transaction.
+  circuit breaker for permission, waits for free send slots, then claims at
+  most that many due rows (shared 70/20/10 between priorities) in one short
+  statement that commits **before** any HTTP call. Each row is sent in its own
+  goroutine, which takes a rate-limit slot from Redis right before the call;
+  the result and the attempt are written in one transaction.
 - **`cmd/mockprovider`** mimics webhook.site (202 + `{messageId, status,
   timestamp}`) with configurable latency and failure rate.
 
@@ -138,11 +138,12 @@ sequenceDiagram
 
     loop every free slot, per channel
         W->>W: circuit breaker allows sends?
-        W->>R: take up to N tokens (atomic Lua)
-        W->>P: claim ≤ tokens due rows, FOR UPDATE SKIP LOCKED<br/>status=processing, attempts+1, locked_until=now()+lease
+        W->>P: claim ≤ free slots due rows, FOR UPDATE SKIP LOCKED<br/>status=processing, attempts+1, locked_until=now()+lease
     end
+    W->>R: rate-limit slot (atomic Lua), right before the call
     W->>X: POST {to, channel, content} (5s timeout)
     X-->>W: 202 {messageId} / 4xx / 5xx / timeout
+    W->>R: send done: slot frees in 1s
     W->>W: classify → sent | retrying (backoff) | failed
     W->>P: INSERT delivery_attempt + conditional UPDATE (fenced by attempt number)
     C->>A: GET /api/v1/notifications/{id}
@@ -219,14 +220,17 @@ Backoff handles brief blips; the breaker handles outages. Together they keep a
 
 ## Rate limiting and priority
 
-- **Rate limit:** a sliding window per channel in Redis, updated by an atomic
-  Lua script using Redis's own clock, so the limit holds across any number of
-  worker replicas. No 1-second window ever holds more than 100 sends per
-  channel (the brief's maximum), and the full 100/s is reached. Workers take
-  slots *before* claiming rows and sleep exactly until the oldest send leaves
-  the window (no spinning). Measured: 200 sends in 2 s with two workers. If
-  Redis is down, sending pauses rather than running unthrottled
-  ([ADR-021](docs/DECISIONS.md#adr-021-distributed-rate-limiting-with-a-redis-sliding-window-lua)).
+- **Rate limit:** a sliding window of sends per channel in Redis, updated by
+  atomic Lua scripts using Redis's own clock, so the limit holds across any
+  number of worker replicas. A send takes a slot right before its HTTP call
+  and keeps it while the request is in flight and for one second after, so
+  the provider never sees more than 100 requests in any second (the brief's
+  maximum), however the network delays them. Measured at a fake provider with
+  three replicas: busiest second exactly 100. The cost: throughput is about
+  `100 / (1 + provider latency)`, e.g. ~95/s at 50ms. Waiting workers sleep,
+  they don't spin. If Redis is down, sending pauses rather than running
+  unthrottled
+  ([ADR-021](docs/DECISIONS.md#adr-021-distributed-rate-limiting-with-a-redis-sliding-window-of-sends-lua)).
 - **Priority:** weighted, so nothing starves. While several priorities are
   waiting, a channel's sends are shared 70/20/10 between `high`, `normal` and
   `low` (`PRIORITY_WEIGHTS`); a priority with nothing due gives its share to

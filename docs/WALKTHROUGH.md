@@ -9,9 +9,9 @@ reasoning behind every choice is in [DECISIONS.md](DECISIONS.md).
 
 The API validates a request, writes the notification to Postgres with status
 `pending` and answers immediately. The notifications table *is* the queue:
-worker goroutines (per channel) take a rate-limit token from Redis, claim due
-rows with `FOR UPDATE SKIP LOCKED`, call the provider over HTTP and record the
-result. Failures are classified as retryable or permanent; retryable ones come
+worker goroutines (per channel) claim due rows with `FOR UPDATE SKIP LOCKED`,
+take a rate-limit slot from Redis right before each call, call the provider
+over HTTP and record the result. Failures are classified as retryable or permanent; retryable ones come
 back later with exponential backoff. Every step is visible through logs with a
 correlation ID, Prometheus metrics, a JSON summary, a WebSocket status stream
 and OpenTelemetry traces.
@@ -40,15 +40,16 @@ and OpenTelemetry traces.
    keep in sync. The API answers **201**.
 5. **Worker loop** `claimLoop` ([worker/worker.go](../internal/worker/worker.go)),
    one per channel: ask the circuit breaker how much it may send, reserve free
-   send slots, take that many tokens from Redis
-   ([ratelimit/limiter.go](../internal/ratelimit/limiter.go), a Lua script),
-   then claim up to that many due rows.
+   send slots, then claim up to that many due rows.
 6. **Claim** ([queue/queue.go](../internal/queue/queue.go)): one statement
    takes due rows by priority share (70/20/10, so low is never starved) with
    `FOR UPDATE SKIP LOCKED` and sets
    `status = 'processing'`, `attempts + 1`, `locked_until = now() + 30s`. It
    commits before any HTTP call.
-7. **Send** `process` → [provider/client.go](../internal/provider/client.go):
+7. **Send** `process`: confirm the row is still ours (`Renew`), take a
+   rate-limit slot from Redis
+   ([ratelimit/limiter.go](../internal/ratelimit/limiter.go), a Lua script),
+   then call [provider/client.go](../internal/provider/client.go):
    `POST {to, channel, content}` with `X-Notification-ID` and
    `X-Correlation-ID`, 5 s timeout, redirects never followed.
 8. **Decide** ([worker/classify.go](../internal/worker/classify.go),
@@ -86,14 +87,15 @@ hash tells a retry (200, same id) from a reused key (409). A replay is answered
 before validation, so a retried scheduled request still succeeds after its
 time has passed. `ON CONFLICT` settles races; 20 parallel requests make one row.
 
-**4. Rate limiting happens before claiming** (ADR-021). Redis keeps, per
-channel, the time of every send in the last second, shared by every worker
-replica. A send is allowed only while fewer than 100 happened in the last
-second, so no second ever has more than 100, and a slot frees the moment
-its send turns one second old, so the full rate is used. The worker takes
-slots *first* and claims only as many rows as it got, so a throttled worker
-never holds rows it cannot send, and unused slots are refunded. If Redis is down the channel pauses (fails closed) rather than risk
-the provider banning us.
+**4. Rate limiting counts sends, as the provider sees them** (ADR-021).
+Redis keeps, per channel, one entry per send that still counts, shared by
+every worker replica. A send takes a slot right before its HTTP call and
+holds it while the request is in flight and for one second after it
+returns. The provider receives each request somewhere in between, so it
+never sees more than 100 in any second, however late the network delivers
+them. The price: throughput is about `100 / (1 + provider latency)`. If Redis
+is down the channel pauses (fails closed) rather than risk the provider
+banning us.
 
 **5. Retries are deliberate** (ADR-019, ADR-023, ADR-024). Retry only what can
 succeed later (timeouts, 5xx, 429, 408). Backoff is exponential with full
@@ -133,7 +135,9 @@ and each fix has a test that failed first.
 | End-to-end latency left out the scheduled wait, unlike the brief's definition | Debate with the Codex version | Created → sent, plus a separate due → sent metric (ADR-026) |
 | Any 2xx counted as `sent`, so a misconfigured URL answering 200 would lose messages silently | Re-reading the brief: its provider contract is 202 | Only 202 is success; another 2xx fails loudly without a retry (ADR-019) |
 | Strict priority let a flood of `high` starve `low` forever; the brief only asks for priority support | Re-reading the brief against our own assumptions | Sends are shared 70/20/10 while several priorities wait (ADR-022) |
-| A token bucket with burst 10 let one second carry 110 sends; burst 1 fixed that but dropped throughput to ~77/s | A test that counts the busiest 1-second window | Sliding window in Redis: never over 100 per second, full 100/s (ADR-021) |
+| A token bucket with burst 10 let one second carry 110 sends; burst 1 fixed that but dropped throughput to ~77/s | A test that counts the busiest 1-second window | Sliding window in Redis (ADR-021) |
+| The sliding window counted grants taken before the claim: a refund could remove another replica's entries, and the provider saw up to 160 sends in a second | The failure-hunter agent, measuring arrivals at a fake provider | Take the slot right before each call and hold it until one second after the call returns (ADR-021) |
+| A half-open probe dropped before its send (a failed ownership check) wedged the channel until restart | The failure-hunter agent | Every early exit hands the probe back, tied to its breaker period (ADR-024) |
 | "Flaky" link errors | Investigating test failures | The disk was full: an environment problem, not code |
 
 ## A five-minute demo

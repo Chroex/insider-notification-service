@@ -1,8 +1,9 @@
 // Package ratelimit is a distributed per-channel rate limiter in Redis: a
-// sliding window log that allows at most PerSecond sends in any 1-second
-// window.
+// sliding window of sends. A send's slot is held while it is in flight and
+// for one second after it finishes, so the provider, whenever it receives a
+// request, never sees more than PerSecond in any 1-second window.
 //
-// The window lives in Redis and is updated by a Lua script, which Redis
+// The window lives in Redis and is updated by Lua scripts, which Redis
 // executes atomically. That makes the limit global: running 1 or 10 worker
 // replicas, the provider still sees at most PerSecond msg/s per channel.
 package ratelimit
@@ -21,14 +22,19 @@ import (
 var (
 	//go:embed acquire.lua
 	acquireSource string
-	//go:embed refund.lua
-	refundSource string
+	//go:embed done.lua
+	doneSource string
 
 	// redis.Script sends EVALSHA and falls back to EVAL on NOSCRIPT, so the
 	// script body crosses the network only once per Redis instance.
 	acquireScript = redis.NewScript(acquireSource)
-	refundScript  = redis.NewScript(refundSource)
+	doneScript    = redis.NewScript(doneSource)
 )
+
+// DefaultMaxSend bounds how long a granted send may stay in flight before
+// its slot is reclaimed anyway (a worker that died mid-send). The worker
+// sets it from PROVIDER_TIMEOUT with WithMaxSend.
+const DefaultMaxSend = 10 * time.Second
 
 // Limit is one channel's limit: sends allowed in any 1-second window.
 type Limit struct {
@@ -41,69 +47,71 @@ type Limiter struct {
 	rdb       redis.Scripter
 	limits    map[domain.Channel]Limit
 	keyPrefix string
+	maxSend   time.Duration
 }
 
 // New returns a limiter. keyPrefix namespaces the window keys (tests use a
 // unique prefix so they don't share windows).
 func New(rdb redis.Scripter, limits map[domain.Channel]Limit, keyPrefix string) *Limiter {
-	return &Limiter{rdb: rdb, limits: limits, keyPrefix: keyPrefix}
+	return &Limiter{rdb: rdb, limits: limits, keyPrefix: keyPrefix, maxSend: DefaultMaxSend}
 }
 
-// TryAcquire makes one attempt to take up to n send slots ("tokens"). It
-// returns how many were granted (possibly fewer than n) and, when none
-// were, how long until the oldest grant leaves the window.
-func (l *Limiter) TryAcquire(ctx context.Context, ch domain.Channel, n int) (int, time.Duration, error) {
+// WithMaxSend sets the longest a send can take (the provider timeout plus a
+// margin): a slot whose send never reports back is freed after it.
+func (l *Limiter) WithMaxSend(d time.Duration) *Limiter {
+	l.maxSend = d
+	return l
+}
+
+// TryAcquire makes one attempt to take a send slot. When granted, done is
+// non-nil and must be called as soon as the send returns (successfully or
+// not); the slot then frees one second later. When not granted, wait says
+// how long to sleep before trying again.
+func (l *Limiter) TryAcquire(ctx context.Context, ch domain.Channel) (done func(), wait time.Duration, err error) {
 	limit, err := l.limit(ch)
 	if err != nil {
-		return 0, 0, err
+		return nil, 0, err
 	}
-	res, err := acquireScript.Run(ctx, l.rdb, l.keys(ch), limit.PerSecond, n).Int64Slice()
+	keys := l.keys(ch)
+	res, err := acquireScript.Run(ctx, l.rdb, keys, limit.PerSecond, l.maxSend.Microseconds()).Int64Slice()
 	if err != nil {
-		return 0, 0, fmt.Errorf("rate limit acquire (%s): %w", ch, err)
+		return nil, 0, fmt.Errorf("rate limit acquire (%s): %w", ch, err)
 	}
 	if len(res) != 2 {
-		return 0, 0, fmt.Errorf("rate limit acquire (%s): unexpected reply %v", ch, res)
+		return nil, 0, fmt.Errorf("rate limit acquire (%s): unexpected reply %v", ch, res)
 	}
-	return int(res[0]), time.Duration(res[1]) * time.Millisecond, nil
+	if member := res[0]; member > 0 {
+		return func() { l.done(keys[0], member) }, 0, nil
+	}
+	return nil, time.Duration(res[1]) * time.Millisecond, nil
 }
 
-// Acquire blocks until at least one slot is granted (returning up to n) or
-// ctx is done. When the window is full it sleeps exactly until the oldest
-// grant expires, so a waiting worker costs one Redis call per wake-up, not
-// a busy loop.
-func (l *Limiter) Acquire(ctx context.Context, ch domain.Channel, n int) (int, error) {
+// Acquire blocks until a send slot is granted or ctx is done. While the
+// window is full it sleeps until a slot may have freed, so a waiting worker
+// costs a few Redis calls per second, not a busy loop.
+func (l *Limiter) Acquire(ctx context.Context, ch domain.Channel) (done func(), err error) {
 	for {
-		granted, wait, err := l.TryAcquire(ctx, ch, n)
-		if err != nil {
-			return 0, err
-		}
-		if granted > 0 {
-			return granted, nil
+		done, wait, err := l.TryAcquire(ctx, ch)
+		if err != nil || done != nil {
+			return done, err
 		}
 		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return 0, ctx.Err()
+			return nil, ctx.Err()
 		case <-timer.C:
 		}
 	}
 }
 
-// Refund gives back n slots that were granted but not used.
-func (l *Limiter) Refund(ctx context.Context, ch domain.Channel, n int) error {
-	if n <= 0 {
-		return nil
-	}
-	if _, err := l.limit(ch); err != nil {
-		return err
-	}
-	if err := refundScript.Run(ctx, l.rdb, l.keys(ch)[:1], n).Err(); err != nil {
-		return fmt.Errorf("rate limit refund (%s): %w", ch, err)
-	}
-	return nil
+// done records that a send finished. If it fails, the slot is still freed
+// once the max send time has passed, so an error only costs throughput.
+func (l *Limiter) done(key string, member int64) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_ = doneScript.Run(ctx, l.rdb, []string{key}, member).Err()
 }
-
 func (l *Limiter) limit(ch domain.Channel) (Limit, error) {
 	limit, ok := l.limits[ch]
 	if !ok {

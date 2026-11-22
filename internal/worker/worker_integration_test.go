@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1295,5 +1296,206 @@ func TestBreaker_ProbeDroppedBeforeSendDoesNotWedgeTheChannel(t *testing.T) {
 				sent, total, w.BreakerState(domain.ChannelSMS), fp.totalCalls(), q.calls.Load())
 		}
 		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// --- rate limit as the provider sees it ---
+
+// arrivalProvider records when each request reached the provider.
+type arrivalProvider struct {
+	*httptest.Server
+	mu    sync.Mutex
+	times []time.Time
+}
+
+func newArrivalProvider(t *testing.T) *arrivalProvider {
+	ap := &arrivalProvider{}
+	ap.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ap.mu.Lock()
+		ap.times = append(ap.times, time.Now())
+		ap.mu.Unlock()
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"messageId":"m","status":"accepted","timestamp":"2026-01-01T00:00:00Z"}`))
+	}))
+	t.Cleanup(ap.Close)
+	return ap
+}
+
+func (ap *arrivalProvider) busiest() (int, int) {
+	ap.mu.Lock()
+	ts := append([]time.Time(nil), ap.times...)
+	ap.mu.Unlock()
+	sort.Slice(ts, func(i, j int) bool { return ts[i].Before(ts[j]) })
+	best := 0
+	for i := range ts {
+		j := i
+		for j < len(ts) && ts[j].Sub(ts[i]) < time.Second {
+			j++
+		}
+		best = max(best, j-i)
+	}
+	return best, len(ts)
+}
+
+// Found by the failure-hunter agent: permits used to be taken before the
+// claim, so the window counted grants, not sends. A cold first batch
+// reached the provider later than the next one, and the provider saw up to
+// 160 sends in one second. Measured where it matters: at the provider,
+// across three replicas, with a backlog and with a bursty trickle.
+func TestRateLimit_ProviderNeverSeesMoreThan100PerSecond(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		backlog int
+		trickle bool
+	}{
+		{"backlog", 600, false},
+		{"trickle", 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db.Reset(t)
+			ap := newArrivalProvider(t)
+			for range tc.backlog {
+				insertNotification(t, domain.ChannelSMS)
+			}
+			prefix := "test-" + uuid.NewString() + ":"
+			limits := map[domain.Channel]ratelimit.Limit{}
+			for _, ch := range domain.Channels {
+				limits[ch] = ratelimit.Limit{PerSecond: 100}
+			}
+			cfg := testConfig()
+			cfg.Concurrency, cfg.ClaimBatchSize = 100, 40
+			cfg.PollInterval = 5 * time.Millisecond
+
+			ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+			defer cancel()
+			var wg sync.WaitGroup
+			if tc.trickle {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					tick := time.NewTicker(10 * time.Millisecond)
+					defer tick.Stop()
+					for ctx.Err() == nil {
+						<-tick.C
+						for range 2 { // ~200/s offered, bursty
+							insertNotification(t, domain.ChannelSMS)
+						}
+					}
+				}()
+			}
+			var stops []func()
+			for range 3 {
+				stops = append(stops, startWorkerWithLimiter(t, ap.URL, cfg, ratelimit.New(rdb.Client, limits, prefix)))
+			}
+			<-ctx.Done()
+			wg.Wait()
+			for _, s := range stops {
+				s()
+			}
+			ap.mu.Lock()
+			if len(ap.times) > 0 {
+				t0 := ap.times[0]
+				buckets := map[int]int{}
+				for _, x := range ap.times {
+					buckets[int(x.Sub(t0)/(50*time.Millisecond))]++
+				}
+				t.Logf("arrivals per 50ms from first: %v", buckets)
+			}
+			ap.mu.Unlock()
+			best, total := ap.busiest()
+			t.Logf("total %d, busiest 1s window %d", total, best)
+			if best > 100 {
+				t.Errorf("provider saw %d sends in one second (limit 100)", best)
+			}
+		})
+	}
+}
+
+// slowRenewQueue makes Renew slow (a database hiccup) for the first second
+// of its life, then fast again.
+type slowRenewQueue struct {
+	*queue.Queue
+	until time.Time
+}
+
+func (q slowRenewQueue) Renew(ctx context.Context, id uuid.UUID, attempt int, lease time.Duration) (bool, error) {
+	if time.Now().Before(q.until) {
+		time.Sleep(400 * time.Millisecond)
+	}
+	return q.Queue.Renew(ctx, id, attempt, lease)
+}
+
+// One replica, a backlog, and a 400ms database hiccup during the first
+// batch's ownership check. When slots were counted at grant time, the first
+// 100 reached the provider ~400ms late while the next 100 went out at once:
+// 200 in one second.
+func TestRateLimit_SlowOwnershipCheckCannotPackTwoSecondsIntoOne(t *testing.T) {
+	db.Reset(t)
+	ap := newArrivalProvider(t)
+	for range 300 {
+		insertNotification(t, domain.ChannelSMS)
+	}
+	limits := map[domain.Channel]ratelimit.Limit{}
+	for _, ch := range domain.Channels {
+		limits[ch] = ratelimit.Limit{PerSecond: 100}
+	}
+	cfg := testConfig()
+	cfg.Concurrency, cfg.ClaimBatchSize = 200, 100
+	cfg.PollInterval = 5 * time.Millisecond
+	q := slowRenewQueue{Queue: queue.New(db.Pool), until: time.Now().Add(300 * time.Millisecond)}
+	_, stop := startWorkerOn(t, q, ap.URL, cfg, ratelimit.New(rdb.Client, limits, "test-"+uuid.NewString()+":"))
+	time.Sleep(2500 * time.Millisecond)
+	stop()
+
+	best, total := ap.busiest()
+	t.Logf("total %d, busiest 1s window %d", total, best)
+	if best > 100 {
+		t.Errorf("provider saw %d sends in one second (limit 100)", best)
+	}
+}
+
+// Written by the failure-hunter agent (the guarantee held). Three replicas
+// share a saturated 100/s window under SKIP LOCKED contention; the sends
+// that reach the provider must still be shared ~70/20/10 while all
+// priorities wait.
+func TestPriority_FairShareHoldsAcrossSaturatedReplicas(t *testing.T) {
+	db.Reset(t)
+	fp := newFakeProvider(t, always(http.StatusAccepted))
+	prio := map[string]domain.Priority{}
+	for _, p := range []domain.Priority{domain.PriorityLow, domain.PriorityNormal, domain.PriorityHigh} {
+		for range 300 {
+			prio[insertNotification(t, domain.ChannelSMS, withPriority(p)).ID.String()] = p
+		}
+	}
+	limits := map[domain.Channel]ratelimit.Limit{}
+	for _, ch := range domain.Channels {
+		limits[ch] = ratelimit.Limit{PerSecond: 100}
+	}
+	prefix := "test-" + uuid.NewString() + ":"
+	cfg := testConfig()
+	cfg.Concurrency, cfg.ClaimBatchSize = 20, 10
+	cfg.PollInterval = 5 * time.Millisecond
+	cfg.PriorityWeights = [3]int{70, 20, 10}
+	var stops []func()
+	for range 3 {
+		stops = append(stops, startWorkerWithLimiter(t, fp.URL, cfg, ratelimit.New(rdb.Client, limits, prefix)))
+	}
+	time.Sleep(2500 * time.Millisecond)
+	for _, s := range stops {
+		s()
+	}
+	order := fp.order()
+	count := map[domain.Priority]int{}
+	for _, id := range order {
+		count[prio[id]]++
+	}
+	n := float64(len(order))
+	t.Logf("%d sends: high %d normal %d low %d", len(order), count[domain.PriorityHigh], count[domain.PriorityNormal], count[domain.PriorityLow])
+	share := func(p domain.Priority) float64 { return float64(count[p]) / n }
+	if share(domain.PriorityHigh) < 0.6 || share(domain.PriorityHigh) > 0.8 ||
+		share(domain.PriorityNormal) < 0.12 || share(domain.PriorityNormal) > 0.28 ||
+		share(domain.PriorityLow) < 0.05 || share(domain.PriorityLow) > 0.15 {
+		t.Errorf("shares high %.2f normal %.2f low %.2f, want ~0.70/0.20/0.10",
+			share(domain.PriorityHigh), share(domain.PriorityNormal), share(domain.PriorityLow))
 	}
 }

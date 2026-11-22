@@ -43,115 +43,122 @@ func newLimiter(perSecond int) (*ratelimit.Limiter, string) {
 	return ratelimit.New(rdb.Client, limits, prefix), prefix
 }
 
+// take grants n slots and finishes each send immediately.
+func take(t *testing.T, l *ratelimit.Limiter, ch domain.Channel, n int) int {
+	t.Helper()
+	got := 0
+	for range n {
+		done, _, err := l.TryAcquire(context.Background(), ch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if done == nil {
+			break
+		}
+		done()
+		got++
+	}
+	return got
+}
+
 func TestTryAcquire_GrantsUpToTheLimitThenWaits(t *testing.T) {
 	l, _ := newLimiter(5)
-	ctx := context.Background()
-
-	granted, _, err := l.TryAcquire(ctx, domain.ChannelSMS, 3)
-	if err != nil || granted != 3 {
-		t.Fatalf("first acquire = %d, %v; want 3", granted, err)
+	if got := take(t, l, domain.ChannelSMS, 7); got != 5 {
+		t.Fatalf("granted %d of 7, want the limit of 5", got)
 	}
-	// Only 2 left in this second: a request for 5 is partially granted.
-	if granted, _, _ := l.TryAcquire(ctx, domain.ChannelSMS, 5); granted != 2 {
-		t.Errorf("partial acquire = %d, want 2", granted)
-	}
-	// Full: nothing granted, and the wait says when the oldest grant leaves
-	// the 1-second window.
-	granted, wait, _ := l.TryAcquire(ctx, domain.ChannelSMS, 1)
-	if granted != 0 || wait <= 0 || wait > time.Second {
-		t.Errorf("full window = granted %d wait %v; want 0 and (0, 1s]", granted, wait)
+	// Full: nothing granted, and the wait says when to look again.
+	done, wait, _ := l.TryAcquire(context.Background(), domain.ChannelSMS)
+	if done != nil || wait <= 0 || wait > time.Second {
+		t.Errorf("full window = granted %v wait %v; want none and (0, 1s]", done != nil, wait)
 	}
 }
 
-// The brief: "maximum 100 messages per second per channel". All 100 may go
-// at once, but the 101st waits until the first is a full second old, so no
-// 1-second window ever holds more than 100. Checked against the limiter
-// itself, so network jitter cannot blur the boundary.
+// The brief: "maximum 100 messages per second per channel". 100 sends may
+// start at once, but the 101st waits until the first finished a full second
+// ago, so no 1-second window ever holds more than 100. Checked against the
+// limiter itself, so network jitter cannot blur the boundary.
 func TestTryAcquire_NeverMoreThanTheLimitInOneSecond(t *testing.T) {
 	l, _ := newLimiter(100)
-	ctx := context.Background()
-
-	if g, _, _ := l.TryAcquire(ctx, domain.ChannelSMS, 150); g != 100 {
-		t.Fatalf("first acquire granted %d, want the full 100", g)
+	start := time.Now()
+	if got := take(t, l, domain.ChannelSMS, 150); got != 100 {
+		t.Fatalf("granted %d, want the full 100", got)
 	}
-	g, wait, _ := l.TryAcquire(ctx, domain.ChannelSMS, 1)
-	if g != 0 || wait < 900*time.Millisecond || wait > time.Second {
-		t.Fatalf("101st = granted %d wait %v; want 0 and a wait of almost 1s", g, wait)
+	end := time.Now() // every send finished between start and end
+	time.Sleep(time.Until(start.Add(900 * time.Millisecond)))
+	if got := take(t, l, domain.ChannelSMS, 1); got != 0 {
+		t.Errorf("granted %d before the first sends were a second old", got)
 	}
-	time.Sleep(wait - 100*time.Millisecond)
-	if g, _, _ := l.TryAcquire(ctx, domain.ChannelSMS, 1); g != 0 {
-		t.Errorf("granted %d before the first grants were a second old", g)
-	}
-	time.Sleep(150 * time.Millisecond)
-	if g, _, _ := l.TryAcquire(ctx, domain.ChannelSMS, 150); g != 100 {
-		t.Errorf("after the window slid, granted %d, want 100 again", g)
+	time.Sleep(time.Until(end.Add(1050 * time.Millisecond)))
+	if got := take(t, l, domain.ChannelSMS, 150); got != 100 {
+		t.Errorf("after the window slid, granted %d, want 100 again", got)
 	}
 }
 
-// Unlike a token bucket, unused capacity is never lost: whatever left the
-// window can be used, however late the caller comes back.
-func TestTryAcquire_SlotsFreeUpAsTheWindowSlides(t *testing.T) {
+// A send still in flight keeps its slot, however long it takes: the
+// provider may receive it at any moment until it answers. Its slot frees one
+// second after it reports done.
+func TestTryAcquire_InFlightSendsHoldTheirSlots(t *testing.T) {
 	l, _ := newLimiter(2)
 	ctx := context.Background()
-	if g, _, _ := l.TryAcquire(ctx, domain.ChannelSMS, 2); g != 2 {
-		t.Fatalf("fill = %d", g)
+	slow, _, _ := l.TryAcquire(ctx, domain.ChannelSMS) // never reported done yet
+	if got := take(t, l, domain.ChannelSMS, 1); got != 1 {
+		t.Fatalf("second slot = %d", got)
 	}
+	time.Sleep(1100 * time.Millisecond)
+	// The fast send's slot has freed; the slow one is still in flight.
+	if got := take(t, l, domain.ChannelSMS, 5); got != 1 {
+		t.Errorf("after 1.1s granted %d, want 1 (the in-flight send holds the other)", got)
+	}
+	slow()
 	time.Sleep(1050 * time.Millisecond)
-	if g, _, _ := l.TryAcquire(ctx, domain.ChannelSMS, 5); g != 2 {
-		t.Errorf("after the window slid granted %d, want 2", g)
+	if got := take(t, l, domain.ChannelSMS, 5); got != 2 {
+		t.Errorf("one second after the slow send finished, granted %d, want 2", got)
 	}
 }
 
-// A refund frees slots for sends that never happened, never more than the
-// limit.
-func TestRefund_FreesUnusedSlots(t *testing.T) {
-	l, _ := newLimiter(5)
-	ctx := context.Background()
-	if g, _, _ := l.TryAcquire(ctx, domain.ChannelSMS, 5); g != 5 {
-		t.Fatalf("fill = %d", g)
+// A worker that dies mid-send never reports done; its slot is reclaimed
+// after the max send time.
+func TestTryAcquire_AbandonedSendFreesAfterMaxSend(t *testing.T) {
+	l, _ := newLimiter(1)
+	l.WithMaxSend(200 * time.Millisecond)
+	if done, _, _ := l.TryAcquire(context.Background(), domain.ChannelSMS); done == nil {
+		t.Fatal("first acquire not granted")
 	}
-	if err := l.Refund(ctx, domain.ChannelSMS, 3); err != nil {
-		t.Fatal(err)
-	}
-	if g, _, _ := l.TryAcquire(ctx, domain.ChannelSMS, 5); g != 3 {
-		t.Errorf("after refund of 3 granted %d, want 3", g)
-	}
-	if err := l.Refund(ctx, domain.ChannelSMS, 100); err != nil {
-		t.Fatal(err)
-	}
-	if g, _, _ := l.TryAcquire(ctx, domain.ChannelSMS, 100); g != 5 {
-		t.Errorf("refund above the limit granted %d, want 5 (capped)", g)
+	time.Sleep(1300 * time.Millisecond) // max send 200ms + 1s window
+	if got := take(t, l, domain.ChannelSMS, 1); got != 1 {
+		t.Error("the abandoned slot was never reclaimed")
 	}
 }
 
-func TestChannelsHaveIndependentBuckets(t *testing.T) {
+func TestChannelsHaveIndependentWindows(t *testing.T) {
 	l, _ := newLimiter(2)
-	ctx := context.Background()
-	if g, _, _ := l.TryAcquire(ctx, domain.ChannelSMS, 2); g != 2 {
-		t.Fatalf("sms drain = %d", g)
+	if got := take(t, l, domain.ChannelSMS, 2); got != 2 {
+		t.Fatalf("sms fill = %d", got)
 	}
-	if g, _, _ := l.TryAcquire(ctx, domain.ChannelEmail, 2); g != 2 {
-		t.Errorf("email granted %d after sms drained, want 2", g)
+	if got := take(t, l, domain.ChannelEmail, 2); got != 2 {
+		t.Errorf("email granted %d after sms filled, want 2", got)
 	}
 }
 
 func TestUnknownChannelIsAnError(t *testing.T) {
 	l, _ := newLimiter(1)
-	if _, _, err := l.TryAcquire(context.Background(), domain.ChannelPush, 1); err == nil {
+	if _, _, err := l.TryAcquire(context.Background(), domain.ChannelPush); err == nil {
 		t.Error("expected an error for a channel without a configured limit")
 	}
 }
 
 func TestAcquire_RespectsContextWhileWaiting(t *testing.T) {
-	l, _ := newLimiter(1) // the next slot frees in 1s
+	l, _ := newLimiter(1) // the next slot frees 1s after this send finishes
 	ctx := context.Background()
-	if _, err := l.Acquire(ctx, domain.ChannelSMS, 1); err != nil {
+	done, err := l.Acquire(ctx, domain.ChannelSMS)
+	if err != nil {
 		t.Fatal(err)
 	}
+	done()
 	ctx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	if _, err := l.Acquire(ctx, domain.ChannelSMS, 1); err == nil {
+	if _, err := l.Acquire(ctx, domain.ChannelSMS); err == nil {
 		t.Fatal("expected context deadline error")
 	}
 	if time.Since(start) > time.Second {
@@ -161,8 +168,8 @@ func TestAcquire_RespectsContextWhileWaiting(t *testing.T) {
 
 // Several limiter instances model several worker replicas: they share one
 // window, so their combined throughput is capped, not each one separately.
-// Over 2 seconds that is at most 2 x 100, and nothing is wasted: the full
-// 200 are used.
+// Over 2 seconds that is at most 2 x 100, and with instant sends nothing is
+// wasted: the full 200 are used.
 func TestAcquire_CapsCombinedThroughputAcrossReplicas(t *testing.T) {
 	const (
 		rate    = 100
@@ -183,12 +190,13 @@ func TestAcquire_CapsCombinedThroughputAcrossReplicas(t *testing.T) {
 			go func() {
 				defer wg.Done()
 				for {
-					n, err := replica.Acquire(ctx, domain.ChannelSMS, 1)
+					done, err := replica.Acquire(ctx, domain.ChannelSMS)
 					redisCalls.Add(1)
 					if err != nil {
 						return
 					}
-					total.Add(int64(n))
+					done() // an instant send
+					total.Add(1)
 				}
 			}()
 		}
@@ -202,8 +210,8 @@ func TestAcquire_CapsCombinedThroughputAcrossReplicas(t *testing.T) {
 	if got < want*0.95 || got > want+5 {
 		t.Errorf("combined grants over %v = %.0f, want ~%.0f (%d/s)", window, got, want, rate)
 	}
-	// No busy spinning: waiters sleep until the next token, so Redis calls
-	// stay within a small multiple of the tokens granted.
+	// No busy spinning: waiters sleep until a slot may have freed, so
+	// acquire calls stay within a small multiple of the slots granted.
 	if calls := redisCalls.Load(); float64(calls) > got*4 {
 		t.Errorf("%d Redis calls for %.0f tokens: callers are spinning", calls, got)
 	}
