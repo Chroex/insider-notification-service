@@ -227,13 +227,13 @@ func (w *Worker) claimLoop(ctx, sendCtx context.Context, ch domain.Channel, infl
 
 		n, ok := acquireSlots(ctx, slots, limit)
 		if !ok {
-			breaker.ReleaseProbe()
+			breaker.ReleaseProbe(gen)
 			return // shutting down
 		}
 
 		tokens, err := w.limiter.Acquire(ctx, ch, n)
 		if err != nil {
-			breaker.ReleaseProbe()
+			breaker.ReleaseProbe(gen)
 			releaseSlots(slots, n)
 			if ctx.Err() != nil {
 				return
@@ -252,7 +252,7 @@ func (w *Worker) claimLoop(ctx, sendCtx context.Context, ch domain.Channel, infl
 		releaseSlots(slots, unused)
 		w.refund(log, ch, unused)
 		if len(jobs) == 0 {
-			breaker.ReleaseProbe() // nothing due, so no probe was sent
+			breaker.ReleaseProbe(gen) // nothing due, so no probe was sent
 		}
 		if err != nil {
 			if ctx.Err() != nil {
@@ -289,6 +289,17 @@ func (w *Worker) process(stopCtx, sendCtx context.Context, job domain.Notificati
 		log = log.With(observability.KeyBatchID, *job.BatchID)
 	}
 
+	// If this job is the half-open probe and ends without a provider result
+	// (any early return below, or a send aborted by our own shutdown), hand
+	// the probe back, or the breaker would wait for its result forever.
+	breaker := w.breakers[job.Channel]
+	recorded := false
+	defer func() {
+		if !recorded {
+			breaker.ReleaseProbe(gen)
+		}
+	}()
+
 	// Shutdown began before this job's send started: hand it back untouched
 	// (attempt refunded) instead of starting a call we may not finish.
 	if stopCtx.Err() != nil {
@@ -297,7 +308,6 @@ func (w *Worker) process(stopCtx, sendCtx context.Context, job domain.Notificati
 	}
 	// The breaker changed state between claim and send (another send on
 	// this channel tripped it): don't add load to a failing provider.
-	breaker := w.breakers[job.Channel]
 	if !breaker.Current(gen) {
 		w.release(log, job, "released job: circuit breaker open")
 		return
@@ -332,6 +342,7 @@ func (w *Worker) process(stopCtx, sendCtx context.Context, job domain.Notificati
 	w.cfg.Observer.AttemptFinished(job.Channel, c.Outcome, duration)
 	if sendCtx.Err() == nil { // a send aborted by our own shutdown says nothing about provider health
 		breaker.Record(c.Outcome, job.ID.String(), gen)
+		recorded = true
 	}
 	decision := w.cfg.Policy.Decide(job.Attempts, job.MaxAttempts, c, w.now())
 	completion := buildCompletion(job, res, c, decision, start, duration)

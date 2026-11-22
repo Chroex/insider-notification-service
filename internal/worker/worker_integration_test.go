@@ -1228,3 +1228,72 @@ func TestQueue_DueTimesUseTheDatabaseClock(t *testing.T) {
 		t.Fatalf("batch row not claimable with a fast app clock: %v, %v", jobs, err)
 	}
 }
+
+// flakyRenewQueue fails the failOn-th ownership check.
+type flakyRenewQueue struct {
+	*queue.Queue
+	calls  *atomic.Int64
+	failOn int64
+}
+
+func (q flakyRenewQueue) Renew(ctx context.Context, id uuid.UUID, attempt int, lease time.Duration) (bool, error) {
+	if q.calls.Add(1) == q.failOn {
+		return false, errors.New("transient: connection reset by peer")
+	}
+	return q.Queue.Renew(ctx, id, attempt, lease)
+}
+
+// The breaker opens after 3 failures. When the cooldown ends, the half-open
+// probe is claimed, but its ownership check hits one transient DB error and
+// the job is released without a send. The probe permit must come back, or
+// the channel stays half-open with a "probe in flight" that never resolves.
+// Found by the failure-hunter agent: a half-open probe whose ownership check
+// fails (transient DB error) was never handed back, so the breaker stayed
+// "probing" forever and the channel never sent again.
+func TestBreaker_ProbeDroppedBeforeSendDoesNotWedgeTheChannel(t *testing.T) {
+	db.Reset(t)
+	var providerDown atomic.Bool
+	providerDown.Store(true)
+	fp := newFakeProvider(t, func(string, int) int {
+		if providerDown.Load() {
+			return http.StatusServiceUnavailable
+		}
+		return http.StatusAccepted
+	})
+	const total = 6
+	for range total {
+		insertNotification(t, domain.ChannelSMS, withMaxAttempts(10))
+	}
+
+	opened := make(chan struct{}, 10)
+	cfg := testConfig()
+	cfg.Concurrency, cfg.ClaimBatchSize = 1, 1
+	cfg.BreakerThreshold, cfg.BreakerCooldown = 3, 300*time.Millisecond
+	cfg.Observer = breakerWatcher{opened: opened}
+	q := flakyRenewQueue{Queue: queue.New(db.Pool), calls: new(atomic.Int64), failOn: 4}
+	w, _ := startWorkerOn(t, q, fp.URL, cfg, worker.Unlimited{})
+
+	select {
+	case <-opened:
+	case <-time.After(5 * time.Second):
+		t.Fatal("breaker never opened")
+	}
+	providerDown.Store(false) // provider recovers during the cooldown
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var sent int
+		if err := db.Pool.QueryRow(context.Background(),
+			"SELECT count(*) FROM notifications WHERE status = 'sent'").Scan(&sent); err != nil {
+			t.Fatal(err)
+		}
+		if sent == total {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d/%d sent 5s after recovery; breaker state %s, provider calls %d, renew calls %d",
+				sent, total, w.BreakerState(domain.ChannelSMS), fp.totalCalls(), q.calls.Load())
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}

@@ -122,12 +122,17 @@ func (b *Breaker) Permits() (permits int, wait time.Duration, gen uint64) {
 	}
 }
 
-// ReleaseProbe returns an unused half-open probe permit (e.g. nothing was
-// due when we tried to claim), so the next loop iteration can probe again.
-func (b *Breaker) ReleaseProbe() {
+// ReleaseProbe returns a half-open probe permit that ended without a
+// result: nothing was due when we claimed, or the claimed job was handed
+// back before its send (shutdown, lost lease, failed ownership check). The
+// next loop iteration can then probe again; without this the breaker would
+// stay "probing" forever and the channel would never send again. gen is the
+// period the permit came from (Permits), so a job from an older period
+// cannot free the slot of the probe that is in flight now.
+func (b *Breaker) ReleaseProbe(gen uint64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.state == BreakerHalfOpen {
+	if b.state == BreakerHalfOpen && gen == b.generation {
 		b.probing = false
 	}
 }

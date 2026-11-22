@@ -117,7 +117,7 @@ func TestBreaker_ReleaseProbeAllowsAnotherProbe(t *testing.T) {
 	if p, _, _ := b.Permits(); p != 1 {
 		t.Fatal("expected probe permit")
 	}
-	b.ReleaseProbe() // nothing was due to send
+	b.ReleaseProbe(b.Generation()) // nothing was due to send
 	if p, _, _ := b.Permits(); p != 1 {
 		t.Error("released probe permit was not handed out again")
 	}
@@ -148,7 +148,7 @@ func TestBreaker_ConcurrentUse(t *testing.T) {
 				} else {
 					b.Record(retryable, key, b.Generation())
 				}
-				b.ReleaseProbe()
+				b.ReleaseProbe(b.Generation())
 			}
 		}()
 	}
@@ -209,5 +209,26 @@ func TestBreaker_StaleResultCannotResolveTheProbe(t *testing.T) {
 	b.Record(ok, "n-probe", probeGen)
 	if b.State() != BreakerClosed {
 		t.Errorf("probe success: state = %s, want closed", b.State())
+	}
+}
+
+// A probe permit is handed back only for its own breaker period: a job from
+// an older period that ends without sending must not free the slot of the
+// probe that is in flight now.
+func TestBreaker_ReleaseProbeIgnoresOtherPeriods(t *testing.T) {
+	b, clock, _ := newTestBreaker(1, time.Second)
+	record(b, domain.OutcomeRetryableError) // opens
+	clock.advance(2 * time.Second)
+	_, _, oldGen := b.Permits() // half-open: this is the probe
+	if p, _, _ := b.Permits(); p != 0 {
+		t.Fatalf("second permit while probing = %d, want 0", p)
+	}
+	b.ReleaseProbe(oldGen - 1) // a stale job ending without a send
+	if p, _, _ := b.Permits(); p != 0 {
+		t.Error("a stale release freed the in-flight probe's slot")
+	}
+	b.ReleaseProbe(oldGen)
+	if p, _, _ := b.Permits(); p != 1 {
+		t.Error("the probe's own release did not allow a new probe")
 	}
 }
