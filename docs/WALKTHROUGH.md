@@ -51,7 +51,7 @@ and OpenTelemetry traces.
    `POST {to, channel, content}` with `X-Notification-ID` and
    `X-Correlation-ID`, 5 s timeout, redirects never followed.
 8. **Decide** ([worker/classify.go](../internal/worker/classify.go),
-   [worker/policy.go](../internal/worker/policy.go)): 2xx → `sent`; 5xx, 429,
+   [worker/policy.go](../internal/worker/policy.go)): 202 → `sent` (any other 2xx is a permanent failure); 5xx, 429,
    408 or a network error → `retrying` with a jittered delay (or `failed` when
    the 5 attempts are used up); any other 4xx → `failed` at once.
 9. **Complete** (`Complete` in queue.go): one transaction writes the

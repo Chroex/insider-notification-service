@@ -88,7 +88,7 @@ func run() error {
 
 	engine := worker.New(
 		queue.New(db),
-		provider.NewClient(cfg.ProviderURL, cfg.Worker.ProviderTimeout),
+		provider.NewClient(cfg.ProviderURL, cfg.Worker.ProviderTimeout, cfg.ProviderSuccessStatus),
 		ratelimit.New(rdb, limits, ""),
 		worker.Config{
 			Channels:        domain.Channels,

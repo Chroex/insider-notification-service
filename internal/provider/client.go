@@ -47,21 +47,29 @@ type Result struct {
 	MessageID  string // empty if the provider did not return one
 }
 
-// StatusError is returned when the provider answers with a non-2xx status.
-// RetryAfter is parsed from the Retry-After header (0 when absent).
+// StatusError is returned when the provider answers with anything other than
+// the contract's success status. RetryAfter is parsed from the Retry-After
+// header (0 when absent). Expected is set when the answer was a different
+// 2xx, so the error says what the contract required.
 type StatusError struct {
 	StatusCode int
+	Expected   int
 	RetryAfter time.Duration
 	Body       string
 }
 
 func (e *StatusError) Error() string {
+	if e.Expected != 0 {
+		return fmt.Sprintf("provider returned HTTP %d, expected %d (the message may have been delivered): %s",
+			e.StatusCode, e.Expected, e.Body)
+	}
 	return fmt.Sprintf("provider returned HTTP %d: %s", e.StatusCode, e.Body)
 }
 
 // Client sends messages to one provider URL.
 type Client struct {
 	url     string
+	success int
 	http    *http.Client
 	timeout time.Duration
 	now     func() time.Time
@@ -70,13 +78,16 @@ type Client struct {
 // NewClient builds a client with a per-attempt timeout. The timeout is
 // applied through the request context rather than http.Client.Timeout so a
 // caller's own cancellation (shutdown) and the per-attempt limit compose.
-func NewClient(url string, timeout time.Duration) *Client {
+// success is the only status that means "accepted": 202 in the brief's
+// provider contract (PROVIDER_SUCCESS_STATUS).
+func NewClient(url string, timeout time.Duration, success int) *Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	// Many concurrent sends go to one host; the default of 2 idle
 	// connections per host would force constant reconnects.
 	transport.MaxIdleConnsPerHost = 100
 	return &Client{
-		url: url,
+		url:     url,
+		success: success,
 		// otelhttp adds a client span per call and the W3C traceparent
 		// header, so a tracing-aware provider joins the same trace.
 		http: &http.Client{
@@ -96,8 +107,8 @@ func NewClient(url string, timeout time.Duration) *Client {
 const maxResponseBytes = 64 << 10
 
 // Send makes one delivery attempt. It returns:
-//   - (Result, nil) when the provider accepted the message (any 2xx),
-//   - (*StatusError) for a non-2xx answer,
+//   - (Result, nil) when the provider answered with the success status,
+//   - (*StatusError) for any other answer, including a different 2xx,
 //   - a transport error (timeout, connection refused, ...) otherwise.
 //
 // Classification into retryable or permanent is the caller's job
@@ -127,16 +138,23 @@ func (c *Client) Send(ctx context.Context, msg Message) (Result, error) {
 	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return Result{}, &StatusError{
+	if resp.StatusCode != c.success {
+		se := &StatusError{
 			StatusCode: resp.StatusCode,
 			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), c.now()),
 			Body:       truncate(strings.TrimSpace(string(body)), 200),
 		}
+		// A different 2xx is not the contract. It is not "sent" (a proxy or
+		// login page can answer 200), and the caller classifies it as
+		// permanent: the provider may have taken it, so a retry could
+		// deliver it twice. Failing loudly beats a silent false "sent".
+		if resp.StatusCode >= 200 && resp.StatusCode <= 299 {
+			se.Expected = c.success
+		}
+		return Result{}, se
 	}
 
-	// The brief's provider answers 202 with a messageId. We treat any 2xx as
-	// accepted (webhook.site defaults to 200) and store the id when present.
+	// The contract's body carries a messageId; store it when present.
 	var accepted acceptedBody
 	_ = json.Unmarshal(body, &accepted)
 	return Result{StatusCode: resp.StatusCode, MessageID: accepted.MessageID}, nil

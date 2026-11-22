@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -34,7 +35,7 @@ func TestSend_AcceptedSendsContractAndHeaders(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	res, err := NewClient(srv.URL, time.Second).Send(context.Background(), testMessage())
+	res, err := NewClient(srv.URL, time.Second, http.StatusAccepted).Send(context.Background(), testMessage())
 	if err != nil {
 		t.Fatalf("Send: %v", err)
 	}
@@ -50,14 +51,34 @@ func TestSend_AcceptedSendsContractAndHeaders(t *testing.T) {
 	}
 }
 
-func TestSend_Plain200WithoutBodyIsAccepted(t *testing.T) {
+// The brief's provider contract is "202 Accepted". Any other 2xx is not that
+// contract: a misconfigured URL (a proxy or login page answering 200) must not
+// be recorded as "sent", which would silently lose the message.
+func TestSend_OtherSuccessCodesAreNotAccepted(t *testing.T) {
+	for _, code := range []int{http.StatusOK, http.StatusCreated, http.StatusNoContent} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(code)
+		}))
+		_, err := NewClient(srv.URL, time.Second, http.StatusAccepted).Send(context.Background(), testMessage())
+		se, ok := IsStatusError(err)
+		if !ok || se.StatusCode != code {
+			t.Errorf("HTTP %d: err = %v, want a StatusError with that code", code, err)
+		} else if !strings.Contains(se.Error(), "expected 202") {
+			t.Errorf("HTTP %d: error %q does not say what was expected", code, se.Error())
+		}
+		srv.Close()
+	}
+}
+
+// PROVIDER_SUCCESS_STATUS lets a real provider with another contract be used.
+func TestSend_ConfiguredSuccessStatusIsAccepted(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()
 
-	res, err := NewClient(srv.URL, time.Second).Send(context.Background(), testMessage())
-	if err != nil || res.MessageID != "" {
+	res, err := NewClient(srv.URL, time.Second, http.StatusOK).Send(context.Background(), testMessage())
+	if err != nil || res.StatusCode != http.StatusOK || res.MessageID != "" {
 		t.Errorf("Send = %+v, %v; want accepted with empty message id", res, err)
 	}
 }
@@ -77,7 +98,7 @@ func TestSend_RedirectIsNotFollowed(t *testing.T) {
 			http.Redirect(w, r, target.URL, code)
 		}))
 
-		_, err := NewClient(srv.URL, time.Second).Send(context.Background(), testMessage())
+		_, err := NewClient(srv.URL, time.Second, http.StatusAccepted).Send(context.Background(), testMessage())
 		se, ok := IsStatusError(err)
 		if !ok || se.StatusCode != code {
 			t.Errorf("redirect %d: err = %v, want a StatusError with that code", code, err)
@@ -98,7 +119,7 @@ func TestSend_StatusErrorWithRetryAfter(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := NewClient(srv.URL, time.Second).Send(context.Background(), testMessage())
+	_, err := NewClient(srv.URL, time.Second, http.StatusAccepted).Send(context.Background(), testMessage())
 	se, ok := IsStatusError(err)
 	if !ok {
 		t.Fatalf("err = %v, want StatusError", err)
@@ -118,7 +139,7 @@ func TestSend_TimeoutIsATransportError(t *testing.T) {
 	defer srv.Close()
 
 	start := time.Now()
-	_, err := NewClient(srv.URL, 50*time.Millisecond).Send(context.Background(), testMessage())
+	_, err := NewClient(srv.URL, 50*time.Millisecond, http.StatusAccepted).Send(context.Background(), testMessage())
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("err = %v, want deadline exceeded", err)
 	}

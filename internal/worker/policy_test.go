@@ -31,6 +31,9 @@ func TestClassify(t *testing.T) {
 		{"404", &provider.StatusError{StatusCode: 404}, domain.OutcomePermanentError, 404},
 		{"422", &provider.StatusError{StatusCode: 422}, domain.OutcomePermanentError, 422},
 		{"301 redirect", &provider.StatusError{StatusCode: 301}, domain.OutcomePermanentError, 301},
+		// A 2xx other than the contract's 202: the message may have arrived,
+		// so retrying could send it twice. Fail loudly, do not retry.
+		{"200 instead of 202", &provider.StatusError{StatusCode: 200, Expected: 202}, domain.OutcomePermanentError, 200},
 		{"wrapped 503", fmt.Errorf("send: %w", &provider.StatusError{StatusCode: 503}), domain.OutcomeRetryableError, 503},
 	}
 	for _, tt := range tests {

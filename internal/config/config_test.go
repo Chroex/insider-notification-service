@@ -28,6 +28,9 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.LogLevel != slog.LevelInfo {
 		t.Errorf("LogLevel = %v, want info", cfg.LogLevel)
 	}
+	if cfg.ProviderSuccessStatus != 202 {
+		t.Errorf("ProviderSuccessStatus = %d, want 202 (the brief's provider contract)", cfg.ProviderSuccessStatus)
+	}
 	if cfg.Validation.SMSMaxChars != 160 || cfg.BatchMaxSize != 1000 || cfg.MaxAttempts != 5 {
 		t.Errorf("unexpected limit defaults: validation=%+v batch=%d attempts=%d",
 			cfg.Validation, cfg.BatchMaxSize, cfg.MaxAttempts)
@@ -75,6 +78,7 @@ func TestLoad_WorkerInvariants(t *testing.T) {
 		{"lease shorter than two provider timeouts", map[string]string{"LEASE_DURATION": "8s", "PROVIDER_TIMEOUT": "5s"}, "LEASE_DURATION"},
 		{"shutdown not longer than provider timeout", map[string]string{"SHUTDOWN_TIMEOUT": "5s", "PROVIDER_TIMEOUT": "5s"}, "SHUTDOWN_TIMEOUT"},
 		{"zero concurrency", map[string]string{"WORKER_CONCURRENCY": "0"}, "WORKER_CONCURRENCY"},
+		{"success status not 2xx", map[string]string{"PROVIDER_SUCCESS_STATUS": "302"}, "PROVIDER_SUCCESS_STATUS"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

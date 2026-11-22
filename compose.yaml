@@ -5,6 +5,7 @@ x-app-env: &app-env
   DATABASE_URL: postgres://notifications:notifications@postgres:5432/notifications?sslmode=disable
   REDIS_URL: redis://redis:6379/0
   PROVIDER_URL: ${PROVIDER_URL:-http://mockprovider:8090/send}
+  PROVIDER_SUCCESS_STATUS: ${PROVIDER_SUCCESS_STATUS:-202}
   # Tracing is on when this is set (unset it to disable). Jaeger UI: :16686
   OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT-http://jaeger:4318}
 

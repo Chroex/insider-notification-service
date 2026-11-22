@@ -550,7 +550,7 @@ instead, which is worse for OTPs and order updates.
 **Decision.**
 - *Retryable:* no HTTP response (connection errors, DNS, per-attempt timeout,
   cancellation), 5xx, 429, 408.
-- *Permanent:* any other 4xx, plus unexpected 1xx/3xx. These are failed
+- *Permanent:* any other 4xx, plus unexpected 1xx/2xx/3xx. These are failed
   immediately: an identical request cannot succeed, and retrying wastes quota
   and can get us rate-limited or flagged by the provider.
 - *Redirects are never followed* (`CheckRedirect` returns the 3xx as-is).
@@ -559,8 +559,17 @@ instead, which is worse for OTPs and order updates.
   provider never received; a 307/308 would re-send recipient and content to
   whatever host the `Location` header names. A provider URL that redirects is
   a configuration error, so the 3xx fails the notification visibly.
-- *Success:* any 2xx. The brief's provider returns 202; webhook.site defaults to
-  200, so we accept both and store `messageId` when present.
+- *Success:* exactly `202 Accepted`, the brief's provider contract
+  (`PROVIDER_SUCCESS_STATUS`, default 202). Any other 2xx fails the
+  notification as a permanent error whose message says "expected 202 (the
+  message may have been delivered)". Why not accept every 2xx: a
+  misconfigured URL (a proxy, a login page) can answer 200, and counting
+  that as `sent` would lose the message silently; a loud `failed` shows up in
+  metrics and the dead-letter list. Why permanent and not retryable: the
+  provider may have taken the message, so an automatic retry could deliver it
+  twice; an operator decides with the error in front of them. The brief tells
+  us to configure webhook.site to answer 202, so a correct setup never hits
+  this. (Revised: an earlier version accepted any 2xx.)
 - An attempt is counted when it is *claimed* (that number is the fencing
   token). A job released on graceful shutdown before its send started has the
   attempt refunded. A job reaped after a crash keeps it, because we can't know

@@ -189,7 +189,7 @@ func startWorkerHandle(t *testing.T, providerURL string, cfg worker.Config, limi
 
 func startWorkerOn(t *testing.T, q worker.Queue, providerURL string, cfg worker.Config, limiter worker.RateLimiter) (*worker.Worker, func()) {
 	t.Helper()
-	w := worker.New(q, provider.NewClient(providerURL, 2*time.Second), limiter, cfg,
+	w := worker.New(q, provider.NewClient(providerURL, 2*time.Second, http.StatusAccepted), limiter, cfg,
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -351,6 +351,25 @@ func TestDelivery_RetriesThenSucceeds(t *testing.T) {
 		if a.AttemptNo != i+1 {
 			t.Errorf("attempt %d has attempt_no %d", i, a.AttemptNo)
 		}
+	}
+}
+
+// A 200 where the contract says 202 is a permanent failure with a clear
+// error, never "sent" (it could be a proxy or login page) and never retried
+// (the provider may have taken it, so a retry could deliver it twice).
+func TestDelivery_UnexpectedSuccessCodeFailsWithoutRetry(t *testing.T) {
+	db.Reset(t)
+	fp := newFakeProvider(t, always(http.StatusOK))
+	n := insertNotification(t, domain.ChannelSMS)
+	startWorker(t, fp.URL, testConfig())
+
+	failed := waitForStatus(t, n.ID, domain.StatusFailed, 5*time.Second)
+	time.Sleep(200 * time.Millisecond)
+	if fp.callsFor(n.ID) != 1 || failed.Attempts != 1 {
+		t.Errorf("provider calls = %d, attempts = %d; want 1, 1", fp.callsFor(n.ID), failed.Attempts)
+	}
+	if !strings.Contains(deref(failed.LastError), "expected 202") {
+		t.Errorf("last_error = %q", deref(failed.LastError))
 	}
 }
 

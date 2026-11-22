@@ -32,6 +32,10 @@ type Config struct {
 	ShutdownTimeout time.Duration
 
 	ProviderURL string
+	// ProviderSuccessStatus is the only HTTP status that means "accepted":
+	// 202 in the brief's provider contract. Any other answer, a different
+	// 2xx included, is not counted as sent.
+	ProviderSuccessStatus int
 
 	// Validation holds per-channel content and recipient limits.
 	Validation validation.Rules
@@ -92,14 +96,15 @@ func Load(lookup LookupFunc) (Config, error) {
 	r := &envReader{lookup: lookup}
 
 	cfg := Config{
-		DatabaseURL:        r.string("DATABASE_URL", "postgres://notifications:notifications@localhost:5432/notifications?sslmode=disable"),
-		DBMaxConns:         r.int("DB_MAX_CONNS", 10),
-		RedisURL:           r.string("REDIS_URL", "redis://localhost:6379/0"),
-		APIAddr:            r.string("API_ADDR", ":8080"),
-		CORSAllowedOrigins: splitList(r.string("CORS_ALLOWED_ORIGINS", "http://localhost:8081")),
-		WorkerAdminAddr:    r.string("WORKER_ADMIN_ADDR", ":8082"),
-		ShutdownTimeout:    r.duration("SHUTDOWN_TIMEOUT", 15*time.Second),
-		ProviderURL:        r.string("PROVIDER_URL", "http://localhost:8090/send"),
+		DatabaseURL:           r.string("DATABASE_URL", "postgres://notifications:notifications@localhost:5432/notifications?sslmode=disable"),
+		DBMaxConns:            r.int("DB_MAX_CONNS", 10),
+		RedisURL:              r.string("REDIS_URL", "redis://localhost:6379/0"),
+		APIAddr:               r.string("API_ADDR", ":8080"),
+		CORSAllowedOrigins:    splitList(r.string("CORS_ALLOWED_ORIGINS", "http://localhost:8081")),
+		WorkerAdminAddr:       r.string("WORKER_ADMIN_ADDR", ":8082"),
+		ShutdownTimeout:       r.duration("SHUTDOWN_TIMEOUT", 15*time.Second),
+		ProviderURL:           r.string("PROVIDER_URL", "http://localhost:8090/send"),
+		ProviderSuccessStatus: r.int("PROVIDER_SUCCESS_STATUS", 202),
 		Validation: validation.Rules{
 			SMSMaxChars:       r.int("SMS_MAX_CHARS", validation.DefaultRules.SMSMaxChars),
 			EmailMaxChars:     r.int("EMAIL_MAX_CHARS", validation.DefaultRules.EmailMaxChars),
@@ -149,6 +154,8 @@ func Load(lookup LookupFunc) (Config, error) {
 	r.require(cfg.Validation.ScheduleMaxAhead > 0, "SCHEDULE_MAX_AHEAD must be positive")
 	r.require(cfg.BatchMaxSize > 0, "BATCH_MAX_SIZE must be positive")
 	r.require(cfg.MaxAttempts > 0, "MAX_ATTEMPTS must be positive")
+	r.require(cfg.ProviderSuccessStatus >= 200 && cfg.ProviderSuccessStatus <= 299,
+		"PROVIDER_SUCCESS_STATUS (%d) must be a 2xx status", cfg.ProviderSuccessStatus)
 
 	w := cfg.Worker
 	r.require(w.Concurrency > 0 && w.ClaimBatchSize > 0, "WORKER_CONCURRENCY and CLAIM_BATCH_SIZE must be positive")

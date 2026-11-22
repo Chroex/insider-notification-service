@@ -158,7 +158,7 @@ stateDiagram-v2
     scheduled --> processing: due, claimed
     pending --> processing: claimed
     retrying --> processing: backoff elapsed, claimed
-    processing --> sent: 2xx
+    processing --> sent: 202
     processing --> retrying: retryable error, attempts left
     processing --> failed: permanent error / attempts exhausted
     processing --> pending: lease expired (reaper) / released on shutdown
@@ -187,7 +187,8 @@ real provider can use to deduplicate ([ADR-018](docs/DECISIONS.md#adr-018-leases
 
 | Outcome of a provider call | Classified as | What happens |
 |---|---|---|
-| 2xx | success | `sent`, `provider_message_id` stored |
+| 202 (`PROVIDER_SUCCESS_STATUS`) | success | `sent`, `provider_message_id` stored |
+| other 2xx (e.g. 200) | permanent | `failed` immediately: it is not the contract, and the message may have arrived, so it is not retried |
 | 4xx except 408/429 | permanent | `failed` immediately, never retried |
 | 5xx, 408, 429, timeout, network error | retryable | `retrying` with backoff, until `MAX_ATTEMPTS` (5) |
 
@@ -396,6 +397,7 @@ problem listed in one error.
 | `WORKER_ADMIN_ADDR` | `:8082` | worker | Health and metrics listen address |
 | `SHUTDOWN_TIMEOUT` | `15s` | api, worker | Max wait for in-flight work on SIGTERM (must exceed `PROVIDER_TIMEOUT`) |
 | `PROVIDER_URL` | `http://localhost:8090/send` | worker | Provider endpoint (compose: the mock) |
+| `PROVIDER_SUCCESS_STATUS` | `202` | worker | The only status counted as accepted |
 | `PROVIDER_TIMEOUT` | `5s` | worker | Per-attempt HTTP timeout |
 | `SMS_MAX_CHARS` | `160` | api | SMS content limit (characters) |
 | `EMAIL_MAX_CHARS` | `10000` | api | Email content limit |
@@ -485,8 +487,9 @@ containers.
 2. In *Edit*, set the default response to status **202**, content type
    `application/json`, and a body such as
    `{"messageId": "demo-1", "status": "accepted", "timestamp": "2026-01-01T00:00:00Z"}`.
-   Any 2xx is accepted, and `messageId` is stored when present (a static value
-   is fine for testing).
+   Only 202 counts as accepted; webhook.site's default 200 would fail every
+   notification with "expected 202". `messageId` is stored when present (a
+   static value is fine for testing).
 3. Point the worker at it:
 
    ```bash
@@ -563,8 +566,10 @@ Validation limits are configurable through environment variables:
   take a batch-level key; individual items in a batch do not.
 - A notification in `processing` cannot be cancelled: it may already be at the
   provider.
-- Any 2xx from the provider counts as accepted (the brief says 202;
-  webhook.site defaults to 200). `messageId` is stored when present.
+- Only `202` from the provider counts as accepted, as the brief's contract
+  says (`PROVIDER_SUCCESS_STATUS` changes it for another provider). Another
+  2xx fails the notification without a retry. `messageId` is stored when
+  present.
 - Rate limits are per channel and global across worker replicas. If Redis is
   down, sending pauses rather than running unthrottled.
 - Priority is strict (high, then normal, then low).
