@@ -37,7 +37,7 @@ var keySeq int
 func record(b *Breaker, outcomes ...domain.AttemptOutcome) {
 	for _, o := range outcomes {
 		keySeq++
-		b.Record(o, fmt.Sprintf("n%d", keySeq))
+		b.Record(o, fmt.Sprintf("n%d", keySeq), b.Generation())
 	}
 }
 
@@ -67,40 +67,40 @@ func TestBreaker_OpensAfterConsecutiveRetryableFailures(t *testing.T) {
 func TestBreaker_FullCycle(t *testing.T) {
 	b, clock, transitions := newTestBreaker(2, 30*time.Second)
 
-	if p, _ := b.Permits(); p != breakerNoLimit {
+	if p, _, _ := b.Permits(); p != breakerNoLimit {
 		t.Fatalf("closed permits = %d, want unlimited", p)
 	}
 
 	record(b, retryable, retryable) // -> open
-	p, wait := b.Permits()
+	p, wait, _ := b.Permits()
 	if p != 0 || wait != 30*time.Second || !b.IsOpen() {
 		t.Fatalf("open: permits=%d wait=%v", p, wait)
 	}
 
 	clock.advance(20 * time.Second)
-	if p, wait := b.Permits(); p != 0 || wait != 10*time.Second {
+	if p, wait, _ := b.Permits(); p != 0 || wait != 10*time.Second {
 		t.Fatalf("mid-cooldown: permits=%d wait=%v, want 0 and 10s", p, wait)
 	}
 
 	clock.advance(10 * time.Second) // cooldown over -> half-open, one probe
-	if p, _ := b.Permits(); p != 1 || b.State() != BreakerHalfOpen {
+	if p, _, _ := b.Permits(); p != 1 || b.State() != BreakerHalfOpen {
 		t.Fatalf("after cooldown: permits=%d state=%s", p, b.State())
 	}
-	if p, _ := b.Permits(); p != 0 {
+	if p, _, _ := b.Permits(); p != 0 {
 		t.Fatalf("second caller during probe got %d permits, want 0", p)
 	}
 
 	record(b, retryable) // probe fails -> open again, cooldown restarts
-	if p, wait := b.Permits(); p != 0 || wait != 30*time.Second {
+	if p, wait, _ := b.Permits(); p != 0 || wait != 30*time.Second {
 		t.Fatalf("failed probe: permits=%d wait=%v", p, wait)
 	}
 
 	clock.advance(30 * time.Second)
-	if p, _ := b.Permits(); p != 1 {
+	if p, _, _ := b.Permits(); p != 1 {
 		t.Fatal("expected a second probe")
 	}
 	record(b, ok) // probe succeeds -> closed
-	if p, _ := b.Permits(); p != breakerNoLimit || b.State() != BreakerClosed {
+	if p, _, _ := b.Permits(); p != breakerNoLimit || b.State() != BreakerClosed {
 		t.Fatalf("after good probe: permits=%d state=%s", p, b.State())
 	}
 
@@ -114,11 +114,11 @@ func TestBreaker_ReleaseProbeAllowsAnotherProbe(t *testing.T) {
 	b, clock, _ := newTestBreaker(1, time.Second)
 	record(b, retryable)
 	clock.advance(time.Second)
-	if p, _ := b.Permits(); p != 1 {
+	if p, _, _ := b.Permits(); p != 1 {
 		t.Fatal("expected probe permit")
 	}
 	b.ReleaseProbe() // nothing was due to send
-	if p, _ := b.Permits(); p != 1 {
+	if p, _, _ := b.Permits(); p != 1 {
 		t.Error("released probe permit was not handed out again")
 	}
 }
@@ -144,9 +144,9 @@ func TestBreaker_ConcurrentUse(t *testing.T) {
 				b.Permits()
 				key := fmt.Sprintf("g%d-%d", i, j)
 				if (i+j)%3 == 0 {
-					b.Record(ok, key)
+					b.Record(ok, key, b.Generation())
 				} else {
-					b.Record(retryable, key)
+					b.Record(retryable, key, b.Generation())
 				}
 				b.ReleaseProbe()
 			}
@@ -160,13 +160,13 @@ func TestBreaker_ConcurrentUse(t *testing.T) {
 func TestBreaker_RetriesOfOneNotificationCountOnce(t *testing.T) {
 	b, _, _ := newTestBreaker(3, time.Minute)
 	for range 10 {
-		b.Record(retryable, "poison")
+		b.Record(retryable, "poison", b.Generation())
 	}
 	if b.State() != BreakerClosed {
 		t.Fatal("one notification's retries opened the breaker")
 	}
-	b.Record(retryable, "a")
-	b.Record(retryable, "b") // poison + a + b = 3 distinct
+	b.Record(retryable, "a", b.Generation())
+	b.Record(retryable, "b", b.Generation()) // poison + a + b = 3 distinct
 	if b.State() != BreakerOpen {
 		t.Errorf("state = %s, want open after 3 distinct failing notifications", b.State())
 	}
@@ -185,5 +185,29 @@ func TestBreaker_StaleFailuresExpire(t *testing.T) {
 	record(b, retryable)
 	if b.State() != BreakerOpen {
 		t.Errorf("state = %s, want open (3 failures, each within 1m of the previous)", b.State())
+	}
+}
+
+// Review finding (Codex comparison): with a short cooldown, a send that
+// started while the breaker was closed could finish during half-open and
+// close the breaker before the real probe answered. Results and sends are
+// tied to the breaker period (generation) they started in.
+func TestBreaker_StaleResultCannotResolveTheProbe(t *testing.T) {
+	b, clock, _ := newTestBreaker(1, 3*time.Second)
+	_, _, oldGen := b.Permits() // a send starts while closed
+	b.Record(retryable, "n-fail", oldGen)
+	if b.Current(oldGen) {
+		t.Error("jobs claimed before the breaker opened must not be sent")
+	}
+
+	clock.advance(3 * time.Second)
+	_, _, probeGen := b.Permits() // half-open: the probe starts
+	b.Record(ok, "n-old", oldGen) // the old send finally succeeds
+	if b.State() != BreakerHalfOpen {
+		t.Fatalf("a stale result changed the breaker to %s; only the probe may decide", b.State())
+	}
+	b.Record(ok, "n-probe", probeGen)
+	if b.State() != BreakerClosed {
+		t.Errorf("probe success: state = %s, want closed", b.State())
 	}
 }

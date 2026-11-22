@@ -200,7 +200,7 @@ func (w *Worker) claimLoop(ctx, sendCtx context.Context, ch domain.Channel, infl
 	breaker := w.breakers[ch]
 
 	for {
-		permits, wait := breaker.Permits()
+		permits, wait, gen := breaker.Permits()
 		if permits == 0 {
 			// Open (wait = rest of the cooldown) or a half-open probe is
 			// already in flight. Sleep rather than poll the database.
@@ -258,7 +258,7 @@ func (w *Worker) claimLoop(ctx, sendCtx context.Context, ch domain.Channel, infl
 			go func() {
 				defer inflight.Done()
 				defer releaseSlots(slots, 1)
-				w.process(ctx, sendCtx, job)
+				w.process(ctx, sendCtx, job, gen)
 			}()
 		}
 		if len(jobs) == 0 {
@@ -268,7 +268,7 @@ func (w *Worker) claimLoop(ctx, sendCtx context.Context, ch domain.Channel, infl
 }
 
 // process makes one delivery attempt and records the outcome.
-func (w *Worker) process(stopCtx, sendCtx context.Context, job domain.Notification) {
+func (w *Worker) process(stopCtx, sendCtx context.Context, job domain.Notification, gen uint64) {
 	log := w.log.With(
 		observability.KeyNotificationID, job.ID,
 		observability.KeyCorrelationID, job.CorrelationID,
@@ -285,10 +285,10 @@ func (w *Worker) process(stopCtx, sendCtx context.Context, job domain.Notificati
 		w.release(log, job, "released unsent job on shutdown")
 		return
 	}
-	// The breaker opened between claim and send (another send on this
-	// channel tripped it): don't add load to a failing provider.
+	// The breaker changed state between claim and send (another send on
+	// this channel tripped it): don't add load to a failing provider.
 	breaker := w.breakers[job.Channel]
-	if breaker.IsOpen() {
+	if !breaker.Current(gen) {
 		w.release(log, job, "released job: circuit breaker open")
 		return
 	}
@@ -318,7 +318,7 @@ func (w *Worker) process(stopCtx, sendCtx context.Context, job domain.Notificati
 	c := Classify(sendErr)
 	w.cfg.Observer.AttemptFinished(job.Channel, c.Outcome, duration)
 	if sendCtx.Err() == nil { // a send aborted by our own shutdown says nothing about provider health
-		breaker.Record(c.Outcome, job.ID.String())
+		breaker.Record(c.Outcome, job.ID.String(), gen)
 	}
 	decision := w.cfg.Policy.Decide(job.Attempts, job.MaxAttempts, c, w.now())
 	completion := buildCompletion(job, res, c, decision, start, duration)

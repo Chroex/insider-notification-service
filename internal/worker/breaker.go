@@ -70,6 +70,13 @@ type Breaker struct {
 	lastFailure time.Time
 	openedAt    time.Time
 	probing     bool // half-open probe permit handed out and not yet resolved
+	// generation counts state changes. A job carries the generation it was
+	// claimed in; a send or result from an older generation belongs to a
+	// period that is over, so it is not sent (Current) or not counted
+	// (Record). Without it, a slow send from before the breaker opened
+	// could finish during half-open and close the breaker before the
+	// real probe answered.
+	generation uint64
 }
 
 // NewBreaker builds a closed breaker. onChange (optional) is called after
@@ -84,29 +91,34 @@ func NewBreaker(threshold int, window, cooldown time.Duration, onChange func(fro
 // Permits reports how many new sends may start: breakerNoLimit when closed,
 // 1 for the half-open probe, 0 otherwise. With 0, wait is the remaining
 // cooldown (or 0 if a probe is already in flight).
-func (b *Breaker) Permits() (permits int, wait time.Duration) {
+//
+// gen is the breaker period the permits belong to; pass it to Current
+// before sending and to Record with the result.
+func (b *Breaker) Permits() (permits int, wait time.Duration, gen uint64) {
 	b.mu.Lock()
 	from := b.state
 	switch b.state {
 	case BreakerClosed:
-		b.mu.Unlock()
-		return breakerNoLimit, 0
+		defer b.mu.Unlock()
+		return breakerNoLimit, 0, b.generation
 	case BreakerOpen:
 		if remaining := b.cooldown - b.now().Sub(b.openedAt); remaining > 0 {
-			b.mu.Unlock()
-			return 0, remaining
+			defer b.mu.Unlock()
+			return 0, remaining, b.generation
 		}
 		b.state, b.probing = BreakerHalfOpen, true
+		b.generation++
+		gen := b.generation
 		b.mu.Unlock()
 		b.notify(from, BreakerHalfOpen)
-		return 1, 0
+		return 1, 0, gen
 	default: // half-open
 		defer b.mu.Unlock()
 		if b.probing {
-			return 0, 0
+			return 0, 0, b.generation
 		}
 		b.probing = true
-		return 1, 0
+		return 1, 0, b.generation
 	}
 }
 
@@ -122,10 +134,17 @@ func (b *Breaker) ReleaseProbe() {
 
 // Record feeds the outcome of one provider call into the breaker. key
 // identifies the notification, so retries of the same one count once.
-func (b *Breaker) Record(outcome domain.AttemptOutcome, key string) {
+//
+// gen is the generation the send's permits came from: a result from an
+// earlier period is ignored.
+func (b *Breaker) Record(outcome domain.AttemptOutcome, key string, gen uint64) {
 	failed := outcome == domain.OutcomeRetryableError
 
 	b.mu.Lock()
+	if gen != b.generation {
+		b.mu.Unlock()
+		return
+	}
 	from, to := b.state, b.state
 	switch b.state {
 	case BreakerClosed:
@@ -150,11 +169,12 @@ func (b *Breaker) Record(outcome domain.AttemptOutcome, key string) {
 			to = BreakerClosed
 		}
 	case BreakerOpen:
-		// Results of sends that started before the breaker opened carry no
-		// new information; the half-open probe decides recovery.
+		// Unreachable: opening starts a new generation and no sends are
+		// permitted while open, so every result here was dropped above.
 	}
 	if to != from {
 		b.state = to
+		b.generation++
 		clear(b.failing)
 		if to == BreakerOpen {
 			b.openedAt = b.now()
@@ -165,6 +185,21 @@ func (b *Breaker) Record(outcome domain.AttemptOutcome, key string) {
 	if to != from {
 		b.notify(from, to)
 	}
+}
+
+// Generation is the current breaker period.
+func (b *Breaker) Generation() uint64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.generation
+}
+
+// Current reports whether the breaker is still in the period gen came
+// from, i.e. no state change happened since those permits were given.
+func (b *Breaker) Current(gen uint64) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return gen == b.generation
 }
 
 // IsOpen reports whether sends must be held back right now.

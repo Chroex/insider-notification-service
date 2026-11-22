@@ -743,6 +743,14 @@ half_open --(probe fails)----------> open (cooldown restarts)
   remaining cooldown instead of polling.
 - **Half-open allows exactly one probe** across the channel's claim loop. If no
   row is due, the probe permit is returned, so the next iteration can try again.
+- **Results belong to the period they started in.** Every state change bumps a
+  generation number; each claimed job carries the generation it was claimed
+  in. A job whose generation is no longer current is released unsent, and a
+  result from an older generation is ignored. Otherwise a slow send from
+  before the breaker opened could finish during half-open and close the
+  breaker before the real probe answered (reachable with a cooldown shorter
+  than the provider timeout; found by comparing with the Codex
+  implementation; unit-tested).
 - Transitions are logged (warn on open, info on close) and exposed through a
   hook that feeds the `circuit_breaker_state{channel}` metric.
 
