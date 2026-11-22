@@ -189,7 +189,7 @@ real provider can use to deduplicate ([ADR-018](docs/DECISIONS.md#adr-018-leases
 | Outcome of a provider call | Classified as | What happens |
 |---|---|---|
 | 202 (`PROVIDER_SUCCESS_STATUS`) | success | `sent`, `provider_message_id` stored |
-| other 2xx (e.g. 200) | permanent | `failed` immediately: it is not the contract, and the message may have arrived, so it is not retried |
+| other 2xx (e.g. 200) | permanent | `failed` immediately: it is not the contract, and the message may have arrived, so it is not retried. It also counts against the provider in the circuit breaker, so a misconfigured provider stops the channel instead of failing the whole queue |
 | 4xx except 408/429 | permanent | `failed` immediately, never retried |
 | 5xx, 408, 429, timeout, network error | retryable | `retrying` with backoff, until `MAX_ATTEMPTS` (5) |
 

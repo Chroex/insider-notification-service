@@ -163,3 +163,17 @@ func TestRetryPolicy_HonoursRetryAfter(t *testing.T) {
 		t.Errorf("huge Retry-After: next = %v, want capped at 1h", d.NextAttemptAt.Sub(now))
 	}
 }
+
+// A different 2xx fails the notification (permanent: it may have been
+// delivered) but counts against the provider in the breaker: it is a
+// contract or configuration problem that will hit every message.
+func TestClassify_UnexpectedSuccessCodeTripsTheBreaker(t *testing.T) {
+	c := Classify(&provider.StatusError{StatusCode: 200, Expected: 202})
+	if c.Outcome != domain.OutcomePermanentError || c.breakerOutcome() != domain.OutcomeRetryableError {
+		t.Errorf("outcome %s, breaker outcome %s; want permanent, counted as a failure",
+			c.Outcome, c.breakerOutcome())
+	}
+	if c := Classify(&provider.StatusError{StatusCode: 400}); c.breakerOutcome() != domain.OutcomePermanentError {
+		t.Error("a plain 400 must not count against the provider")
+	}
+}

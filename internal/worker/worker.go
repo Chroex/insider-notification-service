@@ -334,7 +334,7 @@ func (w *Worker) process(stopCtx, sendCtx context.Context, job domain.Notificati
 	c := Classify(sendErr)
 	w.cfg.Observer.AttemptFinished(job.Channel, c.Outcome, duration)
 	if sendCtx.Err() == nil { // a send aborted by our own shutdown says nothing about provider health
-		breaker.Record(c.Outcome, job.ID.String(), gen)
+		breaker.Record(c.breakerOutcome(), job.ID.String(), gen)
 		recorded = true
 	}
 	decision := w.cfg.Policy.Decide(job.Attempts, job.MaxAttempts, c, w.now())

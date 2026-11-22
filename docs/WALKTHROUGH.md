@@ -137,6 +137,7 @@ and each fix has a test that failed first.
 | Strict priority let a flood of `high` starve `low` forever; the brief only asks for priority support | Re-reading the brief against our own assumptions | Sends are shared 70/20/10 while several priorities wait (ADR-022) |
 | A token bucket with burst 10 let one second carry 110 sends; burst 1 fixed that but dropped throughput to ~77/s | A test that counts the busiest 1-second window | Sliding window in Redis (ADR-021) |
 | The sliding window counted grants taken before the claim: a refund could remove another replica's entries, and the provider saw up to 160 sends in a second | The failure-hunter agent, measuring arrivals at a fake provider | Take the slot right before each call and hold it until one second after the call returns (ADR-021) |
+| A misconfigured provider answering 200 would drain the whole backlog to `failed`, because permanent errors reset the breaker | The interviewer agent | A 2xx other than 202 counts against the provider in the breaker (ADR-019) |
 | A half-open probe dropped before its send (a failed ownership check) wedged the channel until restart | The failure-hunter agent | Every early exit hands the probe back, tied to its breaker period (ADR-024) |
 | "Flaky" link errors | Investigating test failures | The disk was full: an environment problem, not code |
 

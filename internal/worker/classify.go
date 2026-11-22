@@ -16,6 +16,21 @@ type Classification struct {
 	HTTPStatus *int          // nil when no HTTP response was received
 	RetryAfter time.Duration // provider-requested delay, 0 if none
 	Err        string        // human-readable error, "" on success
+	// ContractViolation marks a 2xx other than the expected 202: the
+	// provider is misconfigured, a problem that will hit every message.
+	ContractViolation bool
+}
+
+// breakerOutcome is what the circuit breaker learns from this attempt. A
+// contract violation fails the notification as permanent (it may have been
+// delivered, so it is not retried) but counts against the provider, so the
+// breaker opens and the rest of the queue waits for the fix instead of
+// draining to failed.
+func (c Classification) breakerOutcome() domain.AttemptOutcome {
+	if c.ContractViolation {
+		return domain.OutcomeRetryableError
+	}
+	return c.Outcome
 }
 
 // Classify decides whether a provider error is worth retrying.
@@ -38,7 +53,8 @@ func Classify(err error) Classification {
 	}
 
 	status := se.StatusCode
-	c := Classification{HTTPStatus: &status, RetryAfter: se.RetryAfter, Err: se.Error()}
+	c := Classification{HTTPStatus: &status, RetryAfter: se.RetryAfter, Err: se.Error(),
+		ContractViolation: se.Expected != 0}
 	if isRetryableStatus(status) {
 		c.Outcome = domain.OutcomeRetryableError
 	} else {

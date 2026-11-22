@@ -375,6 +375,41 @@ func TestDelivery_UnexpectedSuccessCodeFailsWithoutRetry(t *testing.T) {
 	}
 }
 
+// A provider answering a 2xx other than 202 is misconfigured (e.g. the
+// webhook.site default of 200). Found by the interviewer agent: permanent
+// errors reset the breaker's streak, so the whole backlog drained to
+// failed. A contract violation now opens the breaker: only the first few
+// notifications fail, the rest wait in the queue for the fix.
+func TestDelivery_UnexpectedSuccessCodeOpensTheBreaker(t *testing.T) {
+	db.Reset(t)
+	fp := newFakeProvider(t, always(http.StatusOK))
+	const total = 20
+	for range total {
+		insertNotification(t, domain.ChannelSMS)
+	}
+	opened := make(chan struct{}, 10)
+	cfg := testConfig()
+	cfg.Concurrency, cfg.ClaimBatchSize = 1, 1
+	cfg.BreakerThreshold, cfg.BreakerCooldown = 3, time.Minute
+	cfg.Observer = breakerWatcher{opened: opened}
+	startWorker(t, fp.URL, cfg)
+
+	select {
+	case <-opened:
+	case <-time.After(5 * time.Second):
+		t.Fatal("breaker never opened on repeated 200s")
+	}
+	time.Sleep(200 * time.Millisecond)
+	var failed int
+	if err := db.Pool.QueryRow(context.Background(),
+		"SELECT count(*) FROM notifications WHERE status = 'failed'").Scan(&failed); err != nil {
+		t.Fatal(err)
+	}
+	if failed != 3 || fp.totalCalls() != 3 {
+		t.Errorf("failed = %d, provider calls = %d; want 3 and 3, the rest kept queued", failed, fp.totalCalls())
+	}
+}
+
 func TestDelivery_PermanentFailureIsNotRetried(t *testing.T) {
 	db.Reset(t)
 	fp := newFakeProvider(t, always(http.StatusBadRequest))

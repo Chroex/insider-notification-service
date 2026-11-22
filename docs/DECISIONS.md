@@ -580,6 +580,12 @@ instead, which is worse for OTPs and order updates.
   twice; an operator decides with the error in front of them. The brief tells
   us to configure webhook.site to answer 202, so a correct setup never hits
   this. (Revised: an earlier version accepted any 2xx.)
+- *A different 2xx also counts against the provider in the circuit breaker*
+  (ADR-024), although the notification itself fails as permanent. It is a
+  contract or configuration problem that will hit every message: without
+  this, permanent errors reset the breaker's streak and a whole backlog
+  drained to `failed` at 100/s (found by the interviewer agent). Now the
+  breaker opens after a few, and the rest wait in the queue for the fix.
 - An attempt is counted when it is *claimed* (that number is the fencing
   token). A job released on graceful shutdown before its send started has the
   attempt refunded. A job reaped after a crash keeps it, because we can't know
