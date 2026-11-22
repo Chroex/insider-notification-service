@@ -295,6 +295,29 @@ func (w *Worker) process(stopCtx, sendCtx context.Context, job domain.Notificati
 		w.release(log, job, "released job: circuit breaker open")
 		return
 	}
+
+	// Take the rate-limit slot right before the call. The slot counts while
+	// the request is in flight and for one second after its answer, which
+	// covers the moment the provider sees it, however long the network
+	// takes (ADR-021).
+	sendDone, ok := w.permitToSend(stopCtx, log, job)
+	if !ok {
+		return
+	}
+	finished := false
+	defer func() {
+		if !finished {
+			sendDone() // not sent after all: free the slot a second from now
+		}
+	}()
+	// The wait can be long, so check again what may have changed during it:
+	// the breaker may have opened, and the lease may have run out and the
+	// row been claimed by another worker. Renew also extends the lease for
+	// the send itself.
+	if !breaker.Current(gen) {
+		w.release(log, job, "released job: circuit breaker opened while waiting for a rate-limit slot")
+		return
+	}
 	if !w.stillOwned(sendCtx, log, job) {
 		return
 	}
@@ -311,15 +334,6 @@ func (w *Worker) process(stopCtx, sendCtx context.Context, job domain.Notificati
 
 	w.cfg.Events.Publish(sendCtx, events.FromNotification(job, w.now())) // status: processing
 
-	// Take the rate-limit slot last, immediately before the call, and give
-	// it back as soon as the call returns: the slot counts while the request
-	// is in flight and for one second after, which covers the moment the
-	// provider sees it, however long the network takes.
-	sendDone, ok := w.permitToSend(stopCtx, log, job)
-	if !ok {
-		return
-	}
-
 	start := w.now()
 	res, sendErr := w.sender.Send(sendCtx, provider.Message{
 		NotificationID: job.ID,
@@ -328,7 +342,14 @@ func (w *Worker) process(stopCtx, sendCtx context.Context, job domain.Notificati
 		Channel:        string(job.Channel),
 		Content:        job.Content,
 	})
-	sendDone()
+	// With an answer, the provider has seen the request: its slot frees one
+	// second from now. Without one (timeout, connection error) the request
+	// may still reach the provider later, so the slot stays taken for the
+	// whole max send time, as acquired.
+	finished = true
+	if _, answered := provider.IsStatusError(sendErr); sendErr == nil || answered {
+		sendDone()
+	}
 	duration := w.now().Sub(start)
 
 	c := Classify(sendErr)
@@ -414,25 +435,35 @@ func (w *Worker) observeDecision(job domain.Notification, d Decision) {
 	}
 }
 
-// permitToSend waits for a rate-limit permit for job's channel. Without
-// one the job is handed back unsent (attempt refunded): on shutdown, or when
-// the limiter is unavailable. The limiter fails closed: without Redis we
-// cannot prove we are under the provider's limit, and being throttled or
-// banned is worse than pausing. The pause holds this send slot for a poll
-// interval, so a Redis outage does not turn into a claim-release loop.
+// permitToSend waits for a rate-limit slot for job's channel. Without one
+// the job is handed back unsent (attempt refunded):
+//   - on shutdown;
+//   - when no slot comes within half the lease: with more waiting rows than
+//     the rate can serve (many replicas, a low per-channel limit, a slow
+//     provider), waiting on would let the lease run out, and the reaper
+//     would give the row to another worker. The row goes back to the queue
+//     instead and is claimed again later;
+//   - when the limiter is unavailable. It fails closed: without Redis we
+//     cannot prove we are under the provider's limit, and being throttled or
+//     banned is worse than pausing. The pause holds this send slot for a
+//     poll interval, so a Redis outage does not become a claim-release loop.
 func (w *Worker) permitToSend(stopCtx context.Context, log *slog.Logger, job domain.Notification) (done func(), ok bool) {
-	done, err := w.limiter.Acquire(stopCtx, job.Channel)
-	if err != nil {
-		if stopCtx.Err() != nil {
-			w.release(log, job, "released unsent job on shutdown")
-			return nil, false
-		}
+	waitCtx, cancel := context.WithTimeout(stopCtx, w.cfg.LeaseDuration/2)
+	defer cancel()
+	done, err := w.limiter.Acquire(waitCtx, job.Channel)
+	switch {
+	case err == nil:
+		return done, true
+	case stopCtx.Err() != nil:
+		w.release(log, job, "released unsent job on shutdown")
+	case waitCtx.Err() != nil:
+		w.release(log, job, "released job: no rate-limit slot within half the lease")
+	default:
 		log.Error("rate limiter unavailable, pausing channel", "error", err)
 		sleep(stopCtx, w.cfg.PollInterval)
 		w.release(log, job, "released job: rate limiter unavailable")
-		return nil, false
 	}
-	return done, true
+	return nil, false
 }
 
 func (w *Worker) release(log *slog.Logger, job domain.Notification, reason string) {

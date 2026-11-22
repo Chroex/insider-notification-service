@@ -492,9 +492,13 @@ recorded. An empty claim sleeps `POLL_INTERVAL` (500ms) before trying again.
   delivered exactly once.
 - **Claiming only as many rows as there are free slots** means a claimed row
   never sits waiting for a send slot while its lease ticks down. It may wait
-  for a rate-limit permit (ADR-021), but at most `WORKER_CONCURRENCY` rows
-  per channel do, for about a second at the full rate, far inside the
-  30-second lease.
+  for a rate-limit slot (ADR-021), at most half the lease: with more waiting
+  rows than the rate can serve (many replicas, a low per-channel limit, a
+  slow provider) a longer wait would let the lease run out and the row be
+  sent by two workers (found by the failure-hunter agent, round 2). After
+  half the lease the row is handed back unsent, attempt refunded, and
+  claimed again later. After the wait the worker re-checks the breaker and
+  ownership (`Renew`, which also extends the lease for the send).
 - **Per-channel loops** isolate channels: a slow SMS provider cannot starve
   email sends.
 
@@ -643,20 +647,35 @@ request is in flight and for one second after it returns**:
 4. A worker that dies mid-send never calls `done`; its entry still expires
    one second after the max send time.
 
-**Why this holds at the provider.** The provider receives each request at
-some moment between our start and its answer. Take any 1-second window of
-arrivals and the request in it whose slot was granted last. Every other
-request in the window either was still in flight at that grant or had
+**Why this holds at the provider.** A request that got an answer reached the
+provider somewhere between our start and that answer. Take any 1-second
+window of arrivals and the request in it whose slot was granted last. Every
+other request in the window either was still in flight at that grant or had
 finished less than a second before it (it arrived inside the window, which
 started less than a second before that grant), so it still held its slot:
 there were at most 99 of them. So the provider never sees more than 100 in
-any second, whatever the network delays. The script reads **Redis's clock**
+any second, whatever the network delays.
+
+A request **without an answer** (timeout, connection error) may still be
+read later, so `done` is not called for it: its slot stays taken for the
+whole max send time. One case is beyond any client: a provider that stalls
+(accepts connections but reads nothing) and recovers processes everything
+queued in its accept backlog at once, even requests we gave up on. The
+circuit breaker bounds that: it opens after the first few timeouts (5 by
+default), so the backlog the provider can build is what was in flight then,
+at most 100 (`TestPermit_StalledProviderSeesAtMost100InASecond`, with a 3s
+stall: busiest second 100; 228 before these fixes). The script reads **Redis's clock**
 (`TIME`), so clock skew between worker hosts cannot inflate the rate.
 
 **Where it sits in the worker.** The claim is sized by free send slots
-(ADR-017); the permit is taken in `process`, after the ownership check and
-immediately before the HTTP call, and released when the call returns.
-Every permit is used, so nothing is ever refunded.
+(ADR-017); the slot is taken in `process`, immediately before the HTTP call,
+and marked done when the call returns with an answer. The wait is bounded by
+half the lease, and the breaker and row ownership are checked again after
+it (ADR-017, ADR-024). A slot taken but not used (the breaker opened, the
+row was lost) is marked done at once, so it frees a second later. Keys
+expire once every entry could have left the window, but a replica never
+shortens a TTL another replica set (replicas may disagree on
+`PROVIDER_TIMEOUT` during a rolling change).
 
 **Defaults.** 100 per second per channel (`RATE_LIMIT_<CHANNEL>_PER_SECOND`).
 
@@ -676,6 +695,12 @@ fake provider: 200 sends in 2s.
    between grant and send varied (claim, ownership check, a cold
    connection), the provider saw up to 160 sends in one second (200 with a
    slow database).
+3. The third design (this one) was broken four more times by the same
+   agent in a second round, all fixed with regression tests: a job waiting
+   for a slot sent after the breaker opened; a wait longer than the lease
+   let two workers send one row; timed-out requests released their slots
+   early (a stalled provider saw 228 in a second); and a replica with a
+   shorter `PROVIDER_TIMEOUT` shortened the key's TTL.
 
 **Failure mode: fail closed.** If Redis is unreachable, the job is handed
 back unsent after a poll interval (the send slot stays busy meanwhile, so
@@ -817,7 +842,9 @@ half_open --(probe fails)----------> open (cooldown restarts)
 - **While open, nothing is claimed.** Notifications stay `pending`/`retrying`
   with their attempt budget intact (tested: 7 of 10 untouched at
   `attempts = 0`). A job already claimed when the breaker trips is released
-  before sending, with its attempt refunded. The claim loop sleeps for the
+  before sending, with its attempt refunded, including a job that was
+  waiting for a rate-limit slot when it tripped (checked again after the
+  wait). The claim loop sleeps for the
   remaining cooldown instead of polling.
 - **Half-open allows exactly one probe** across the channel's claim loop. If no
   row is due, the probe permit is returned, so the next iteration can try again.
