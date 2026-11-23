@@ -45,7 +45,7 @@ knowing well, and lists the bugs found along the way.
 
 ## Quick start
 
-Requirements: Docker with Compose v2. Go 1.22+ only if you want to run tests
+Requirements: Docker with Compose v2. Go 1.27+ (the version in go.mod) only if you want to run tests
 or binaries outside Docker.
 
 ```bash
