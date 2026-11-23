@@ -79,7 +79,7 @@ flowchart LR
         api[HTTP API<br/>validate · idempotency · enqueue]
     end
     subgraph worker_box [cmd/worker x N replicas]
-        claim[Claim loop per channel<br/>breaker → rate limit → claim]
+        claim[Claim loop per channel<br/>breaker → free slots → claim]
         send[Send slots<br/>provider call + record]
         reaper[Lease reaper]
     end
